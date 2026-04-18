@@ -62,27 +62,15 @@ This application uses [Finnhub](https://finnhub.io/) for real-time stock data. Y
 - Company news (up to 1 year)
 - Company profiles
 
-### 4. Configure Environment Variables
-
-Create a `.env` file in the project root:
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` and add your Finnhub API key:
-
-```env
-VITE_STOCK_API_KEY=your_finnhub_api_key_here
-```
-
-### 5. Run the Application
+### 4. Run the Application
 
 ```bash
 npm run dev
 ```
 
 This will start the Vite development server and launch the Electron app.
+
+Once the app is running, go to **Settings → Data Sources** and enter your Finnhub API key there. The key is saved locally and takes effect immediately — no restart required.
 
 ## Development Commands
 

@@ -27,6 +27,34 @@ function createWindow() {
     },
   });
 
+  // 设置 Content-Security-Policy，消除 Electron 安全警告
+  // 开发模式需要允许 localhost Vite dev server 的 ws:// 和 http://
+  mainWindow.webContents.session.webRequest.onHeadersReceived((details, callback) => {
+    const isDev = !!process.env.VITE_DEV_SERVER_URL;
+    const csp = isDev
+      ? [
+          "default-src 'self' 'unsafe-inline' http://localhost:* ws://localhost:*;",
+          "script-src 'self' 'unsafe-inline';",
+          "style-src 'self' 'unsafe-inline';",
+          "img-src 'self' data: https:;",
+          "connect-src 'self' https://finnhub.io http://localhost:* ws://localhost:*;",
+        ].join(' ')
+      : [
+          "default-src 'self';",
+          "script-src 'self';",
+          "style-src 'self' 'unsafe-inline';",
+          "img-src 'self' data: https:;",
+          "connect-src 'self' https://finnhub.io;",
+        ].join(' ');
+
+    callback({
+      responseHeaders: {
+        ...details.responseHeaders,
+        'Content-Security-Policy': [csp],
+      },
+    });
+  });
+
   if (process.env.VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
     mainWindow.webContents.openDevTools();
@@ -107,57 +135,130 @@ ipcMain.handle('settings-set', (_event, key: string, value: unknown) => {
   return true;
 });
 
-// IPC handler for A 股实时行情（通过 AKShare stock_zh_a_spot）
+// ── Python 脚本路径辅助 ──────────────────────────────────────────────────────
+// 统一入口：scripts/main.py（基于 providers/ 包的多 Provider 架构）
+function getPythonScriptPath(): string {
+  return process.env.VITE_DEV_SERVER_URL
+    // 开发模式：__dirname = dist-electron/，scripts/ 在项目根，只需一层 ..
+    ? join(__dirname, '../scripts/main.py')
+    : join(process.resourcesPath, 'scripts/main.py');
+}
+
+// ── Provider 优先级辅助 ───────────────────────────────────────────────────────
+// 从 electron-store 读取各市场 provider 优先级，供 Python 脚本使用
+// 默认值与 Settings.tsx 中的 DEFAULT_*_PROVIDERS 保持一致
+
+function getCnProviders(): string {
+  const stored = store.get('settings.cnProviderPriority');
+  if (Array.isArray(stored) && stored.length > 0) return (stored as string[]).join(',');
+  return 'tushare,akshare';
+}
+
+function getHkProviders(): string {
+  const stored = store.get('settings.hkProviderPriority');
+  if (Array.isArray(stored) && stored.length > 0) return (stored as string[]).join(',');
+  return 'akshare_hk';
+}
+
+function getUsProviders(): string {
+  const stored = store.get('settings.usProviderPriority');
+  if (Array.isArray(stored) && stored.length > 0) return (stored as string[]).join(',');
+  return 'finnhub,yfinance';
+}
+
+// Token 辅助：从 electron-store 读取各 provider 的 Token/Key
+function getTushareToken(): string {
+  return (store.get('settings.tushareToken') as string | undefined) ?? '';
+}
+
+function getFinnhubApiKey(): string {
+  return (store.get('settings.finnhubApiKey') as string | undefined) ?? '';
+}
+
+// 通用 Python 脚本执行辅助（带 try-catch 防止 execFile 同步抛出异常）
+function runPythonScript(
+  args: string[],
+  timeoutMs: number,
+  resolve: (value: string) => void,
+): void {
+  const scriptPath = getPythonScriptPath();
+  try {
+    execFile(
+      'python3',
+      [scriptPath, ...args],
+      { timeout: timeoutMs },
+      (error, stdout, stderr) => {
+        if (error) {
+          resolve(JSON.stringify({ error: 'exec_failed', message: stderr || error.message }));
+          return;
+        }
+        resolve(stdout.trim());
+      },
+    );
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    resolve(JSON.stringify({ error: 'exec_failed', message }));
+  }
+}
+
+// 构建 Token 参数列表（仅在 Token 非空时追加）
+function buildTokenArgs(): string[] {
+  const args: string[] = [];
+  const tushareToken = getTushareToken();
+  const finnhubKey = getFinnhubApiKey();
+  if (tushareToken) args.push('--tushare-token', tushareToken);
+  if (finnhubKey) args.push('--finnhub-key', finnhubKey);
+  return args;
+}
+
+// IPC handler for A 股实时行情
+// 数据源优先级由 settings.cnProviderPriority 控制，默认 tushare → akshare
 ipcMain.handle('stock-get-cn-quote', (_event, symbols: string): Promise<string> => {
   return new Promise((resolve) => {
-    const scriptPath = process.env.VITE_DEV_SERVER_URL
-      ? join(__dirname, '../../scripts/yfinance_fetch.py')
-      : join(process.resourcesPath, 'scripts/yfinance_fetch.py');
-
-    try {
-      execFile(
-        'python3',
-        [scriptPath, '--action', 'cn_quote', '--symbols', symbols],
-        { timeout: 60000 },
-        (error, stdout, stderr) => {
-          if (error) {
-            resolve(JSON.stringify({ error: 'exec_failed', message: stderr || error.message }));
-            return;
-          }
-          resolve(stdout.trim());
-        },
-      );
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      resolve(JSON.stringify({ error: 'exec_failed', message }));
-    }
+    const args = [
+      '--action', 'cn_quote',
+      '--symbols', symbols,
+      '--cn-providers', getCnProviders(),
+      ...buildTokenArgs(),
+    ];
+    runPythonScript(args, 60000, resolve);
   });
 });
 
-// IPC handler for A 股搜索（从 AKShare 全量数据中模糊匹配）
+// IPC handler for A 股搜索
+// 数据源优先级由 settings.cnProviderPriority 控制
 ipcMain.handle('stock-search-cn', (_event, query: string): Promise<string> => {
   return new Promise((resolve) => {
-    const scriptPath = process.env.VITE_DEV_SERVER_URL
-      ? join(__dirname, '../../scripts/yfinance_fetch.py')
-      : join(process.resourcesPath, 'scripts/yfinance_fetch.py');
+    const args = [
+      '--action', 'cn_search',
+      '--query', query,
+      '--cn-providers', getCnProviders(),
+      ...buildTokenArgs(),
+    ];
+    runPythonScript(args, 60000, resolve);
+  });
+});
 
-    try {
-      execFile(
-        'python3',
-        [scriptPath, '--action', 'cn_search', '--query', query],
-        { timeout: 60000 },
-        (error, stdout, stderr) => {
-          if (error) {
-            resolve(JSON.stringify({ error: 'exec_failed', message: stderr || error.message }));
-            return;
-          }
-          resolve(stdout.trim());
-        },
-      );
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      resolve(JSON.stringify({ error: 'exec_failed', message }));
-    }
+// IPC handler for 港股实时行情
+// 数据源优先级由 settings.hkProviderPriority 控制，默认 akshare_hk
+ipcMain.handle('stock-get-hk-quote', (_event, symbols: string): Promise<string> => {
+  return new Promise((resolve) => {
+    const args = [
+      '--action', 'hk_quote',
+      '--symbols', symbols,
+      '--hk-providers', getHkProviders(),
+    ];
+    runPythonScript(args, 30000, resolve);
+  });
+});
+
+// IPC handler for 关键指数行情
+// 数据源：A 股指数（上证、科创综指）→ AKShare stock_zh_index_spot_sina
+//         港股指数（恒生、恒生科技）→ AKShare stock_hk_index_spot_sina
+//         美股指数（纳斯达克、标普）→ AKShare index_us_stock_sina（最近两日对比计算涨跌）
+ipcMain.handle('stock-get-indices', (): Promise<string> => {
+  return new Promise((resolve) => {
+    runPythonScript(['--action', 'get_indices'], 30000, resolve);
   });
 });
 
@@ -168,38 +269,23 @@ ipcMain.handle('show-notification', (_event, title: string, body: string) => {
   }
 });
 
-// IPC handler for stock historical data（双数据源：AKShare 优先，yfinance 降级）
-// 通过 child_process 调用 Python 脚本获取历史 K 线数据
-// 参考 TradingAgents-CN 的多数据源降级机制
+// IPC handler for stock historical data
+// 数据源路由由 providers/ 架构根据 --cn-providers / --hk-providers / --us-providers 控制：
+//   A 股（6位数字）→ 按 cnProviderPriority 顺序（默认 tushare → akshare）
+//   港股（XXXXX.HK）→ 按 hkProviderPriority 顺序（默认 akshare_hk）
+//   美股（其他）    → yfinance
 ipcMain.handle(
   'stock-get-history',
   (_event, symbol: string, startDate: string, endDate: string): Promise<string> => {
     return new Promise((resolve) => {
-      // 脚本路径：开发模式下相对于项目根目录，生产模式下相对于 app.getAppPath()
-      const scriptPath = process.env.VITE_DEV_SERVER_URL
-        ? join(__dirname, '../../scripts/stock_fetch.py')
-        : join(process.resourcesPath, 'scripts/stock_fetch.py');
-
-      try {
-        execFile(
-          'python3',
-          [scriptPath, symbol, startDate, endDate],
-          { timeout: 30000 },
-          (error, stdout, stderr) => {
-            if (error) {
-              // 将错误信息序列化为 JSON 字符串返回，由 renderer 解析
-              resolve(JSON.stringify({ error: 'exec_failed', message: stderr || error.message }));
-              return;
-            }
-            // stdout 是 Python 脚本输出的 JSON 字符串
-            resolve(stdout.trim());
-          },
-        );
-      } catch (err: unknown) {
-        // execFile 本身同步抛出异常时（如 python3 不存在）的兜底处理
-        const message = err instanceof Error ? err.message : String(err);
-        resolve(JSON.stringify({ error: 'exec_failed', message }));
-      }
+      const args = [
+        symbol, startDate, endDate,
+        '--cn-providers', getCnProviders(),
+        '--hk-providers', getHkProviders(),
+        '--us-providers', getUsProviders(),
+        ...buildTokenArgs(),
+      ];
+      runPythonScript(args, 30000, resolve);
     });
   },
 );

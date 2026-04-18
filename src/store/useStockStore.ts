@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { Quote, StockQuestion } from '@/types';
+import type { Quote, StockQuestion, IndexQuote } from '@/types';
 
 /** 涨跌色风格：cn = 红涨绿跌（中国），us = 绿涨红跌（美股） */
 export type ColorMode = 'cn' | 'us';
@@ -86,6 +86,8 @@ export const getTodayDateString = (): string => {
 interface StockState {
   watchlist: string[];
   quotes: Record<string, Quote>;
+  /** symbol → 公司名称的映射，添加股票时从搜索结果保存，持久化到 electron-store */
+  symbolNames: Record<string, string>;
   loading: boolean;
   error: string | null;
   rateLimited: boolean;
@@ -97,6 +99,9 @@ interface StockState {
   // Actions
   addToWatchlist: (symbol: string) => Promise<void>;
   removeFromWatchlist: (symbol: string) => Promise<void>;
+  /** 保存 symbol 对应的公司名称（从搜索结果的 description 字段获取） */
+  setSymbolName: (symbol: string, name: string) => Promise<void>;
+  loadSymbolNames: () => Promise<void>;
   updateQuote: (symbol: string, quote: Quote) => void;
   updateQuotes: (quotes: Quote[]) => void;
   loadWatchlist: () => Promise<void>;
@@ -125,11 +130,16 @@ interface StockState {
   addQuestion: (symbol: string, question: string) => Promise<void>;
   /** 删除指定 id 的问题记录 */
   deleteQuestion: (id: string) => Promise<void>;
+  /** 关键指数行情（上证、科创综指、纳斯达克、标普、恒生、恒生科技） */
+  indices: IndexQuote[];
+  /** 拉取最新指数行情，失败时静默保留上次数据 */
+  fetchIndices: () => Promise<void>;
 }
 
 export const useStockStore = create<StockState>((set, get) => ({
   watchlist: [],
   quotes: {},
+  symbolNames: {},
   loading: false,
   error: null,
   rateLimited: false,
@@ -138,9 +148,40 @@ export const useStockStore = create<StockState>((set, get) => ({
   alertThresholds: {},
   visibleColumns: DEFAULT_VISIBLE_COLUMNS,
   questions: [],
+  indices: [],
+
+  setSymbolName: async (symbol: string, name: string) => {
+    if (!name || !name.trim()) return;
+    const updated = { ...get().symbolNames, [symbol]: name.trim() };
+    set({ symbolNames: updated });
+    try {
+      await window.electronAPI.setStore('symbolNames', updated);
+    } catch (error) {
+      console.error('Failed to save symbolNames:', error);
+    }
+  },
+
+  loadSymbolNames: async () => {
+    try {
+      const saved = await window.electronAPI.getStore('symbolNames');
+      if (saved && typeof saved === 'object' && !Array.isArray(saved)) {
+        set({ symbolNames: saved as Record<string, string> });
+      }
+    } catch (error) {
+      console.error('Failed to load symbolNames:', error);
+    }
+  },
 
   addToWatchlist: async (symbol: string) => {
-    const upperSymbol = symbol.toUpperCase().trim();
+    let upperSymbol = symbol.toUpperCase().trim();
+
+    // 港股代码补全前导零到 5 位（如 3690.HK → 03690.HK）
+    // 原因：yfinance 要求港股代码必须是 5 位数字 + .HK，缺少前导零会导致数据获取失败
+    const hkMatch = upperSymbol.match(/^(\d{1,4})(\.HK)$/i);
+    if (hkMatch) {
+      upperSymbol = hkMatch[1].padStart(5, '0') + hkMatch[2].toUpperCase();
+    }
+
     const currentWatchlist = get().watchlist;
     
     if (currentWatchlist.includes(upperSymbol)) {
@@ -397,6 +438,22 @@ export const useStockStore = create<StockState>((set, get) => ({
       await window.electronAPI.setStore('stockQuestions', updated);
     } catch (error) {
       console.error('Failed to delete question:', error);
+    }
+  },
+
+  fetchIndices: async () => {
+    try {
+      const rawJson = await window.electronAPI.getIndices();
+      // 从 rawJson 中提取最后一个完整 JSON 数组（防止 AKShare tqdm 进度条污染 stdout）
+      const jsonMatch = rawJson.match(/(\[[\s\S]*\])\s*$/);
+      const cleanJson = jsonMatch ? jsonMatch[1] : rawJson;
+      const parsed = JSON.parse(cleanJson);
+      if (Array.isArray(parsed)) {
+        set({ indices: parsed as IndexQuote[] });
+      }
+    } catch (error) {
+      // 静默失败：保留上次数据，不影响主流程
+      console.error('Failed to fetch indices:', error);
     }
   },
 }));

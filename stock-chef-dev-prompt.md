@@ -10,11 +10,16 @@
 
 - **零切换成本**：在桌面常驻，无需打开浏览器或手机 App
 - **自选股聚焦**：只看自己关心的股票，信息密度高、噪音低
-- **轻量分析辅助**：提供基础技术指标参考，帮助用户形成初步判断
+- **多市场覆盖**：同时支持 A 股、港股、美股实时行情监控
+- **轻量分析辅助**：提供真实技术指标（RSI/SMA，基于历史 K 线数据）
 
-**目标用户**：有一定投资经验、主要关注美股市场、习惯在 Mac 上工作的个人投资者。
+**目标用户**：有一定投资经验、关注 A 股/港股/美股市场、习惯在 Mac 上工作的个人投资者。
 
-**数据来源**：Finnhub 免费 API（美股，60次/分钟限额）。
+**数据来源**：
+- **A 股**：Tushare Pro（有 Token 时优先）→ AKShare stock_zh_a_hist_tx（腾讯财经，降级）
+- **港股**：AKShare stock_hk_spot（新浪财经，10min 缓存）→ stock_hk_daily（降级）
+- **美股**：Finnhub 免费 API（60次/分钟限额）
+- **历史 K 线**：AKShare / yfinance（双数据源降级）
 
 ---
 
@@ -22,63 +27,108 @@
 
 | 层次 | 技术选型 | 说明 |
 |------|----------|------|
-| 桌面容器 | Electron | macOS 原生窗口，IPC 安全通信 |
+| 桌面容器 | Electron | macOS 原生窗口，IPC 安全通信，自定义无标题栏 |
 | 前端框架 | React 18 + TypeScript | 严格类型，`noUnusedLocals: true` |
 | 构建工具 | Vite + `vite-plugin-electron` | 同时构建 renderer 和 main 进程 |
 | UI 组件库 | Ant Design 5.x | 跟随系统深色/浅色模式 |
-| 状态管理 | Zustand | 全局 watchlist 和 quotes 状态 |
-| HTTP 客户端 | Axios | 所有请求必须经过 `apiRequest()` 限流队列 |
+| 状态管理 | Zustand | 全局 watchlist、quotes、indices 等状态 |
+| HTTP 客户端 | Axios | 所有 Finnhub 请求必须经过 `apiRequest()` 限流队列 |
 | 本地持久化 | electron-store | 存储路径：`~/Library/Application Support/stocker-chef/` |
-| 路由 | React Router v6 | 两个主路由：`/` 和 `/analysis/:symbol` |
+| 数据层（Python） | AKShare / Tushare / yfinance | 多 Provider 架构，`scripts/providers/` 包 |
 
 ---
 
-## 三、已实现功能（v1.0 基线）
+## 三、已实现功能（当前版本）
 
-### 3.1 股票仪表盘（`/`）
+### 3.1 股票仪表盘（Dashboard）
 
 **自选股管理**
-- 搜索框实时搜索 Finnhub 股票代码（输入即触发，结果最多展示 5 条）
-- 点击搜索结果一键添加到自选股列表，symbol 自动转大写
-- 每张股票卡片右上角有删除按钮，点击移除自选股
+- 搜索框智能路由：A 股（纯数字/中文）→ AKShare 本地全量数据匹配；港股（X.HK 格式）→ 本地即时识别；美股（纯字母）→ 本地即时识别 + Finnhub 异步补充
+- 点击搜索结果一键添加，symbol 自动转大写；港股代码自动补全前导零到 5 位（如 `3690.HK` → `03690.HK`）
 - 自选股列表通过 IPC 持久化到 `electron-store`，key 固定为 `'watchlist'`
+- 删除按钮移除自选股，同步清除报价缓存
 
-**实时报价展示**
-- 卡片式布局，响应式网格（xs:1列 / sm:2列 / md:3列 / lg:4列）
-- 每张卡片展示：股票代码、最新价、涨跌额、涨跌幅百分比
-- 涨跌颜色：上涨绿色（`#52c41a`）、下跌红色（`#ff4d4f`），卡片左边框同色
-- 报价每 10 秒自动轮询刷新，支持手动点击"Refresh All Quotes"按钮触发
+**实时报价展示（行式表格）**
+- 行式表格布局，列可配置（代码/最新价/涨跌幅/涨跌额/最高/最低/今开/昨收/成交量）
+- 按市场分组并发请求：A 股 → `getCNQuote`（AKShare 批量）；港股 → `getHKQuote`（AKShare 批量）；美股 → `getQuoteDirect`（Finnhub 并发）
+- 涨跌色风格可切换：中国风格（红涨绿跌）/ 美股风格（绿涨红跌），持久化到 `electron-store`
+- 刷新间隔可配置（10s / 1min / 5min / 10min / 30min），默认 5 分钟
+- 冷启动时先展示当天报价缓存，同时后台刷新
 - 加载中显示 Spin 占位，API 限流时展示 Warning Alert
 
-**导航**
-- 点击股票卡片跳转到 `/analysis/:symbol` 分析页
+**关键指数卡片**
+- 页面顶部展示 6 个预设指数：上证指数、科创综指、恒生指数、恒生科技、纳斯达克、标普500
+- 数据来源：A 股指数 → AKShare；港股指数 → AKShare；美股指数 → AKShare（取最近两日日线计算涨跌）
+- 数据未到时显示占位符 `—`，不阻塞页面渲染
+
+**价格提醒**
+- 每只股票可单独设置涨跌幅阈值（默认 ±5%）和价格上下限
+- 触发时通过 Electron `Notification` API 发送 macOS 系统通知
+- 5 分钟内同一条件不重复通知
+
+**列配置**
+- 用户可自定义显示哪些列，配置持久化到 `electron-store`（key: `'visibleColumns'`）
+- `symbol` 列始终可见，其余列可自由勾选
 
 ---
 
-### 3.2 股票分析页（`/analysis/:symbol`）
+### 3.2 股票分析页（Analysis）
 
 **顶部报价区**
 - 展示股票代码、公司名称、最新价、涨跌幅
-- 报价通过 `useStockQuote` hook 每 10 秒自动刷新
+- 报价通过 `useStockQuote` hook 按配置间隔自动刷新
 
 **详情 Tab**
-- 通过 Finnhub `stock/profile2` 接口获取公司基本信息
+- 通过 Finnhub `stock/profile2` 接口获取公司基本信息（仅美股）
 - 展示字段：公司名称、Symbol、市值（⚠️ 当前展示值偏小 100 万倍，已知 Bug）、行业/国家、开盘价、昨收价、日内高低、成交量、最后更新时间
 
 **新闻 Tab**
-- 获取最近 7 天内最多 20 条相关新闻
+- 获取最近 7 天内最多 20 条相关新闻（Finnhub，仅美股）
 - 展示：标题（可点击跳转原文）、来源、发布时间、摘要（截断展示）
 - 内置 5 分钟内存缓存，减少重复 API 调用
 
+**K 线图 Tab**
+- 展示历史 K 线图（基于 `getHistoricalData()` 获取真实数据）
+- 数据来源标注：`[AKShare]` / `[yfinance]` / `[SIMULATED DATA]`（网络不通时降级）
+
 **技术分析 Modal**
 - 点击"Technical Analysis"按钮触发
-- 展示模拟指标：RSI(14)、SMA20、SMA50、SMA200
+- 基于真实历史 K 线数据计算：RSI(14)、SMA20、SMA50、SMA200
 - 根据 RSI 和均线位置输出 Buy / Hold / Sell 建议
-- ⚠️ **所有指标均为随机模拟值**，页面内有免责声明，不可用于真实投资决策
+- 数据来源标注：`[AKShare]`、`[yfinance]`、`[SIMULATED DATA]`（网络不通时降级为随机模拟）
+
+**历史问题记录**
+- 用户可在分析页输入问题，记录持久化到 `electron-store`（key: `'stockQuestions'`）
+- 支持按 symbol 过滤查看历史问题，支持删除
 
 ---
 
-### 3.3 基础设施
+### 3.3 设置页（Settings）
+
+**数据源配置**
+- **AKShare**：免费无需配置，显示 Ready 状态
+- **yfinance**：免费无需配置，显示 Ready 状态
+- **Tushare**：输入 Token 后存储到 `settings.tushareToken`，A 股行情优先使用
+- **Finnhub**：输入 API Key 后存储到 `settings.finnhubApiKey`，美股行情使用
+- Key 保存后立即生效，无需重启
+
+**Provider 优先级配置**
+- A 股 Provider 优先级：`tushare,akshare`（可调整顺序）
+- 港股 Provider 优先级：`akshare_hk`
+- 美股 Provider 优先级：`finnhub,yfinance`
+
+**涨跌色风格**
+- 中国风格（红涨绿跌）/ 美股风格（绿涨红跌）
+
+---
+
+### 3.4 基础设施
+
+**多市场数据路由**（`scripts/main.py` + `scripts/providers/`）
+- A 股（6位纯数字）→ Tushare（有 Token）→ AKShare stock_zh_a_hist_tx（腾讯财经）
+- 港股（XXXXX.HK）→ AKShare stock_hk_spot（新浪财经，10min 缓存）→ stock_hk_daily（降级）
+- 美股（其他）→ Finnhub / yfinance
+- 所有 Python 输出均有 stdout 重定向保护，防止 AKShare tqdm 进度条污染 JSON
 
 **API 限流队列**（`src/services/stockApi.ts`）
 - 最大 30 次/分钟（Finnhub 免费层 60次/分钟的 50%）
@@ -87,11 +137,16 @@
 
 **IPC 安全通信**
 - `contextIsolation: true` + `nodeIntegration: false`
-- Renderer 只能通过 `window.electronAPI.getStore()` / `window.electronAPI.setStore()` 访问本地存储
+- Renderer 只能通过 `window.electronAPI.*` 访问主进程能力
+- 完整 IPC 通道列表见 `AGENTS.md` 第 4 节
 
 **主题系统**（`src/theme/config.ts`）
 - 自动跟随 macOS 系统深色/浅色模式
 - 主色调 `#1890ff`，圆角 `8px`
+
+**自定义标题栏**
+- 完全隐藏原生标题栏（`titleBarStyle: 'hidden'`），交通灯移出可见区域
+- 自定义窗口控制按钮通过 IPC 调用 `window-minimize/maximize/close`
 
 ---
 
@@ -103,121 +158,68 @@
 
 ### P0：修复已知 Bug
 
-#### BUG-001 修复：市值展示单位错误
+#### BUG-001 修复：市值展示单位错误（待修复）
 - **问题**：`getProfile()` 返回的 `marketCapitalization` 单位是百万美元，但 `formatMarketCap()` 将其当作美元处理，导致展示值偏小 100 万倍
 - **修复方案 A**：在 `getProfile()` 中将 `data.marketCapitalization * 1_000_000` 后再赋值给 `Stock.marketCap`
 - **修复方案 B**：修改 `formatMarketCap()` 接受百万美元单位的输入，内部乘以 `1_000_000` 后再换算
 - **推荐方案 B**：改动范围更小，只需修改 `src/utils/format.ts`，不影响数据层
 
-#### BUG-002 修复：搜索结果不自动清空
+#### BUG-002 修复：搜索结果不自动清空（待修复）
 - **问题**：点击搜索框外部空白处，搜索结果下拉列表不会关闭
 - **修复方案**：在搜索 Input 上添加 `onBlur` 处理，延迟 200ms 后清空 `searchResults`（延迟是为了让点击搜索结果的事件先触发）
 
-#### BUG-004 修复：TypeScript 编译错误
-- 删除 `App.tsx` 中未使用的 `theme` import
-- 将 `Analysis.tsx` 中 `<Text ellipsis={{ rows: 2 }}>` 改为 `<Typography.Paragraph ellipsis={{ rows: 2 }}>`
-- 从 `Dashboard.tsx` 解构中移除未使用的 `updateQuote` 和 `loading`
-
 ---
 
-### P1：仪表盘增强
+### P1：分析页增强
 
-#### 1.1 股票卡片展示公司名称
-- **现状**：卡片只显示 symbol（如 `AAPL`），不显示公司名称
-- **需求**：在 symbol 下方展示公司简称（如 `Apple Inc.`）
-- **实现思路**：在 `addToWatchlist()` 时同步调用 `getProfile()` 获取公司名，存入新的持久化字段（key: `'stockNames'`，格式：`Record<string, string>`）；卡片渲染时从该字段读取
-
-#### 1.2 自选股排序与分组
-- **需求**：支持用户手动拖拽排序自选股卡片
-- **实现思路**：引入 `@dnd-kit/core` 实现拖拽排序，排序结果持久化到 `electron-store`（key: `'watchlistOrder'`）
-- **约束**：不修改 `'watchlist'` key 的存储格式，排序信息单独存储
-
-#### 1.3 涨跌幅排行榜视图
-- **需求**：在仪表盘顶部增加一个迷你排行榜，展示自选股中涨幅最大和跌幅最大的各 3 只
-- **实现思路**：基于 `quotes` 状态计算，无需新增 API 调用；使用 Ant Design `Statistic` 组件展示
-
-#### 1.4 价格提醒（系统通知）
-- **需求**：用户可为每只股票设置价格上限/下限提醒，触发时发送 macOS 系统通知
-- **实现思路**：
-  1. 新增 IPC 通道 `notify`，在 `main.ts` 中使用 Electron `Notification` API
-  2. 在 `preload.ts` 暴露 `window.electronAPI.notify(title, body)`
-  3. 更新 `electron.d.ts` 类型声明
-  4. 在 `useStockStore.ts` 新增 `priceAlerts` 状态（key: `'priceAlerts'`，格式：`Record<string, { upper?: number; lower?: number }>`）
-  5. 在报价刷新逻辑中检查是否触发提醒
-
----
-
-### P2：分析页增强
-
-#### 2.1 52 周高低价展示
+#### 1.1 52 周高低价展示
 - **现状**：`Stock` 类型已定义 `high52Week` 和 `low52Week` 字段，但 `getProfile()` 未填充这两个字段
 - **需求**：在详情 Tab 中展示 52 周最高价和最低价，以及当前价格在区间内的位置（进度条）
 - **实现思路**：Finnhub `stock/profile2` 接口不提供 52 周数据，需调用 `metric` 接口（`/stock/metric?symbol=AAPL&metric=all`）获取 `52WeekHigh` 和 `52WeekLow`；在 `stockApi.ts` 新增 `getMetrics(symbol)` 函数
 
-#### 2.2 同行业对比
+#### 1.2 同行业对比
 - **需求**：在分析页新增"同行业对比"Tab，展示同行业 3-5 只股票的关键指标对比（市值、涨跌幅）
 - **实现思路**：Finnhub 提供 `/stock/peers` 接口返回同行业股票列表；对列表中的股票批量调用 `getQuote()`，结果以表格形式展示
 - **约束**：批量请求必须走 `apiRequest()` 队列，不能并发直接调用
 
-#### 2.3 历史走势迷你图
-- **需求**：在股票卡片和分析页顶部展示最近 30 天的价格走势迷你折线图
-- **实现思路**：引入 `recharts` 库（轻量，与 Ant Design 兼容好）；历史数据来源需要 Finnhub 付费接口，**免费层替代方案**：使用 Yahoo Finance 非官方 API 或在 UI 上明确标注"历史图表需要付费 API"
-- **约束**：如使用模拟数据，必须在图表上方显示"模拟数据"标签
-
-#### 2.4 财务指标展示
+#### 1.3 财务指标展示
 - **需求**：在详情 Tab 新增财务指标区块，展示 P/E Ratio、EPS、ROE、Debt/Equity 等
 - **实现思路**：调用 Finnhub `/stock/metric?metric=all` 接口；在 `src/types/index.ts` 新增 `StockMetrics` 类型；在 `stockApi.ts` 新增 `getMetrics(symbol)` 函数
 
 ---
 
-### P3：体验优化
+### P2：体验优化
 
-#### 3.1 全局搜索快捷键
+#### 2.1 全局搜索快捷键
 - **需求**：按下 `Cmd+K` 打开全局搜索框（类似 Spotlight），可快速搜索并跳转到股票分析页
 - **实现思路**：在 `App.tsx` 中监听 `keydown` 事件；使用 Ant Design `Modal` + `Input.Search` 实现搜索 UI
 
-#### 3.2 自选股导入/导出
+#### 2.2 自选股导入/导出
 - **需求**：支持将自选股列表导出为 CSV 文件，以及从 CSV 文件批量导入
 - **实现思路**：
   1. 新增 IPC 通道 `export-watchlist` 和 `import-watchlist`，在 `main.ts` 中使用 `dialog.showSaveDialog()` / `dialog.showOpenDialog()` 和 `fs` 模块处理文件
   2. 在 `preload.ts` 暴露对应方法
   3. 在 Dashboard 顶部添加导入/导出按钮
 
-#### 3.3 刷新倒计时显示
-- **需求**：在仪表盘右下角显示距离下次自动刷新的倒计时（如"下次刷新：8s"）
-- **实现思路**：在 `Dashboard.tsx` 中新增 `countdown` 状态，每秒递减，刷新时重置为 10
-
-#### 3.4 空状态引导优化
-- **现状**：watchlist 为空时显示 Ant Design 默认 `Empty` 组件，文案简单
-- **需求**：替换为更友好的引导页，包含：示例股票代码（AAPL、TSLA、MSFT）的快速添加按钮、简短的使用说明
-
-#### 3.5 键盘导航支持
-- **需求**：在仪表盘支持方向键选择股票卡片，Enter 键跳转分析页，Delete 键删除选中股票
-- **实现思路**：在 `Dashboard.tsx` 中维护 `selectedIndex` 状态，监听 `keydown` 事件
+#### 2.3 空状态引导优化
+- **现状**：watchlist 为空时显示简单引导文案
+- **需求**：增加示例股票代码（AAPL、TSLA、000001、03690.HK）的快速添加按钮，覆盖三个市场
 
 ---
 
-### P4：架构升级（长期）
+### P3：架构升级（长期）
 
-#### 4.1 修复技术分析为真实计算
-- **现状**：RSI、SMA 均为随机模拟值
-- **需求**：接入真实历史 K 线数据，计算真实技术指标
-- **数据来源选项**：
-  - Finnhub 付费层（`/stock/candle` 接口）
-  - Alpha Vantage 免费层（每分钟 5 次，每天 500 次）
-  - Yahoo Finance 非官方 API（不稳定，不推荐生产使用）
-- **实现约束**：修复后必须移除 UI 上的"模拟数据"免责声明，并在 `AGENTS.md` 的 3.3 节更新约束
+#### 3.1 A 股股票名称展示
+- **现状**：A 股行情返回的 `name` 字段在 `stock_info_a_code_name()` 未缓存时降级为代码本身（如 `000001`）
+- **需求**：在首次搜索/添加时异步加载股票名称缓存，持久化到 `electron-store`（key: `'stockNames'`）
+- **约束**：`stock_info_a_code_name()` 有 tqdm 进度条，必须在 stdout 重定向保护下调用
 
-#### 4.2 多数据源支持
-- **需求**：支持切换数据源（Finnhub / Alpha Vantage），在设置页配置 API Key
-- **实现思路**：抽象 `IStockDataProvider` 接口，`stockApi.ts` 改为工厂模式；新增设置页 `/settings`
-
-#### 4.3 投资组合追踪
+#### 3.2 投资组合追踪
 - **需求**：支持记录持仓（买入价、数量），计算盈亏
 - **实现思路**：新增 `Portfolio` 类型和持久化存储（key: `'portfolio'`）；新增 `/portfolio` 路由页面
 - **约束**：持仓数据不得与实时报价数据混存，分开持久化
 
-#### 4.4 数据导出与备份
+#### 3.3 数据导出与备份
 - **需求**：支持将自选股、持仓记录、价格提醒配置一键导出为 JSON 备份文件，并支持从备份恢复
 - **实现思路**：在 `main.ts` 中实现完整的 `electron-store` 序列化/反序列化逻辑
 
@@ -228,25 +230,22 @@
 ### 已定义（`src/types/index.ts`）
 
 ```typescript
-Quote           // 实时报价：symbol, price, change, changePercent, high, low, open, previousClose, volume, timestamp
+Quote           // 实时报价：symbol, price, change, changePercent, high, low, open, previousClose, volume?, timestamp
 Stock           // 股票基本信息：symbol, name, price, change, changePercent, marketCap?, peRatio?, high52Week?, low52Week?, description?
 NewsItem        // 新闻条目：title, source, publishedAt, url, summary?
-AnalysisResult  // 技术分析（模拟）：symbol, rsi?, sma20?, sma50?, sma200?, recommendation, summary
+AnalysisResult  // 技术分析：symbol, rsi?, sma20?, sma50?, sma200?, recommendation, summary, source('akshare'|'yfinance'|'simulated')
 StockProfile    // Finnhub 公司档案（API 原始格式）：name, exchange, marketCapitalization, country, industry...
 SearchResult    // 搜索结果：symbol, description, displaySymbol, type
+HistoricalDataPoint  // 历史 K 线单根：date, open, high, low, close, volume
+HistoricalDataResult // 历史 K 线结果：data, source('akshare'|'yfinance'|'simulated'), error?
+IndexQuote      // 指数行情：symbol, name, price, change, changePercent
+StockQuestion   // 历史问题记录：id, symbol, question, createdAt
 ```
 
 ### 待新增（随功能迭代补充到 `src/types/index.ts`）
 
 ```typescript
-// P1.4 价格提醒
-interface PriceAlert {
-  upper?: number;   // 价格上限，触发时通知
-  lower?: number;   // 价格下限，触发时通知
-}
-// 存储格式：Record<string, PriceAlert>，key 为 symbol
-
-// P2.4 财务指标
+// P1.3 财务指标
 interface StockMetrics {
   peRatio?: number;           // 市盈率（TTM）
   eps?: number;               // 每股收益
@@ -257,11 +256,11 @@ interface StockMetrics {
   dividendYield?: number;     // 股息率（%）
 }
 
-// P4.3 持仓记录
+// P3.2 持仓记录
 interface PortfolioPosition {
   symbol: string;
   shares: number;             // 持仓数量
-  averageCost: number;        // 平均成本价（USD）
+  averageCost: number;        // 平均成本价
   purchasedAt: string;        // 首次买入时间（ISO 8601）
 }
 ```
@@ -272,20 +271,25 @@ interface PortfolioPosition {
 
 ### 已实现（`src/services/stockApi.ts`）
 
-| 函数 | Finnhub 接口 | 说明 |
-|------|-------------|------|
-| `getQuote(symbol)` | `GET /quote` | 实时报价 |
-| `getProfile(symbol)` | `GET /stock/profile2` | 公司基本信息 |
-| `getNews(symbol)` | `GET /company-news` | 最近 7 天新闻（最多 20 条） |
-| `searchSymbol(query)` | `GET /search` | 股票代码搜索 |
+| 函数 | 数据源 | 说明 |
+|------|--------|------|
+| `getQuote(symbol)` | Finnhub `GET /quote` | 美股实时报价（需 Key） |
+| `getQuoteDirect(symbol)` | Finnhub `GET /quote` | 美股实时报价（不走限流队列，批量并发用） |
+| `getProfile(symbol)` | Finnhub `GET /stock/profile2` | 公司基本信息（需 Key） |
+| `getNews(symbol)` | Finnhub `GET /company-news` | 最近 7 天新闻（需 Key） |
+| `searchSymbol(query)` | Finnhub `GET /search` | 美股代码搜索（需 Key） |
+| `getHistoricalData(symbol, startDate, endDate)` | AKShare / yfinance（IPC） | 历史 K 线（三市场，不需要 Key） |
+| `getCNQuote(symbol)` | AKShare stock_zh_a_hist_tx（IPC） | A 股实时行情（不需要 Key） |
+| `searchCNSymbol(query)` | AKShare 全量数据（IPC） | A 股搜索（不需要 Key） |
+| `isCNStock(symbol)` | 本地判断 | 是否为 A 股（6位纯数字） |
+| `isHKStock(symbol)` | 本地判断 | 是否为港股（XXXXX.HK 格式） |
 
 ### 待实现
 
 | 函数 | Finnhub 接口 | 对应功能 |
 |------|-------------|---------|
-| `getMetrics(symbol)` | `GET /stock/metric?metric=all` | P2.1 52周高低 / P2.4 财务指标 |
-| `getPeers(symbol)` | `GET /stock/peers` | P2.2 同行业对比 |
-| `getCandles(symbol, resolution, from, to)` | `GET /stock/candle` | P4.1 真实历史 K 线（付费） |
+| `getMetrics(symbol)` | `GET /stock/metric?metric=all` | P1.1 52周高低 / P1.3 财务指标 |
+| `getPeers(symbol)` | `GET /stock/peers` | P1.2 同行业对比 |
 
 ---
 
@@ -295,29 +299,43 @@ interface PortfolioPosition {
 
 | 通道名 | 方向 | 说明 |
 |--------|------|------|
+| `window-minimize` | renderer → main | 最小化窗口 |
+| `window-maximize` | renderer → main | 最大化/还原窗口 |
+| `window-close` | renderer → main | 关闭窗口 |
 | `store-get` | renderer → main | 读取 electron-store |
 | `store-set` | renderer → main | 写入 electron-store |
+| `settings-get` | renderer → main | 读取用户设置（`settings.*` 命名空间） |
+| `settings-set` | renderer → main | 写入用户设置 |
+| `stock-get-history` | renderer → main | 历史 K 线（调用 Python scripts/main.py） |
+| `stock-get-cn-quote` | renderer → main | A 股实时行情（AKShare） |
+| `stock-search-cn` | renderer → main | A 股搜索（AKShare） |
+| `stock-get-hk-quote` | renderer → main | 港股实时行情（AKShare） |
+| `stock-get-indices` | renderer → main | 关键指数行情（6 个预设指数） |
+| `show-notification` | renderer → main | macOS 系统通知（价格提醒） |
 
 ### 待实现
 
 | 通道名 | 方向 | 对应功能 |
 |--------|------|---------|
-| `notify` | renderer → main | P1.4 价格提醒系统通知 |
-| `export-watchlist` | renderer → main | P3.2 导出自选股 CSV |
-| `import-watchlist` | renderer → main | P3.2 导入自选股 CSV |
-| `export-backup` | renderer → main | P4.4 全量数据备份 |
-| `import-backup` | renderer → main | P4.4 从备份恢复 |
+| `export-watchlist` | renderer → main | P2.2 导出自选股 CSV |
+| `import-watchlist` | renderer → main | P2.2 导入自选股 CSV |
+| `export-backup` | renderer → main | P3.3 全量数据备份 |
+| `import-backup` | renderer → main | P3.3 从备份恢复 |
 
 ---
 
 ## 八、已知约束与限制
 
-1. **仅支持美股**：Finnhub 免费层只提供美股数据，A 股/港股需要其他数据源
-2. **API 限额**：Finnhub 免费层 60次/分钟，自选股超过 20 只时 10 秒轮询会触发限流
-3. **技术分析为模拟数据**：RSI、SMA 均为随机值，不可用于真实投资决策
-4. **市值展示有 Bug**：当前展示值偏小 100 万倍（见 BUG-001）
-5. **仅支持 macOS 打包**：`electron-builder` 配置仅生成 `.dmg`，Windows/Linux 需额外配置
-6. **无自动化测试**：当前无单元测试和 E2E 测试，修改后需手动验证
+1. **多市场支持**：A 股（AKShare/Tushare）、港股（AKShare）、美股（Finnhub/yfinance）均已支持；Finnhub Key 为可选配置，不配置时 A 股/港股/历史 K 线仍可正常使用
+2. **A 股行情接口**：使用 `stock_zh_a_hist_tx`（腾讯财经），无成交量字段（`volume` 返回 0）；东方财富接口（`stock_zh_a_hist`）在部分网络环境下不可用，已弃用
+3. **A 股股票名称**：`stock_info_a_code_name()` 有 tqdm 进度条且可能超时，不在行情获取关键路径上调用；名称缓存为空时显示代码本身
+4. **港股行情**：`stock_hk_spot` 在部分网络环境下不可用，降级到 `stock_hk_daily`，总耗时约 10s，前端超时设为 35s
+5. **Finnhub API 限额**：免费层 60次/分钟，自选股超过 20 只时批量刷新会触发限流；默认刷新间隔已调整为 5 分钟
+6. **技术分析**：RSI/SMA 基于真实历史 K 线数据计算（AKShare/yfinance）；网络不通时降级为随机模拟，UI 标注 `[SIMULATED DATA]`
+7. **市值展示有 Bug**：Finnhub 返回的 `marketCapitalization` 单位是百万美元，`formatMarketCap()` 将其当作美元处理，展示值偏小 100 万倍（见 BUG-001，待修复）
+8. **仅支持 macOS 打包**：`electron-builder` 配置仅生成 `.dmg`，Windows/Linux 需额外配置
+9. **无自动化测试**：当前无单元测试和 E2E 测试，修改后需手动验证（`npx tsc --noEmit` 是唯一自动化验证手段）
+10. **Python 数据层 stdout 保护**：所有调用 AKShare 的 Python 函数必须在 `sys.stdout = sys.stderr` 保护下运行，防止 tqdm 进度条污染 JSON 输出
 
 ---
 

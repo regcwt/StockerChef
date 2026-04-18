@@ -78,6 +78,20 @@ export interface HistoricalDataResult {
   error?: string;
 }
 
+/** 关键指数行情 */
+export interface IndexQuote {
+  /** 指数代码，如 '000001.SH'、'^IXIC' */
+  symbol: string;
+  /** 指数名称，如 '上证指数' */
+  name: string;
+  /** 最新点位 */
+  price: number;
+  /** 涨跌额 */
+  change: number;
+  /** 涨跌幅（百分比，如 1.23 表示 +1.23%） */
+  changePercent: number;
+}
+
 /** 用户在分析页面输入的问题记录 */
 export interface StockQuestion {
   /** 唯一 ID，格式：timestamp-random */

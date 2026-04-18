@@ -13,11 +13,35 @@ import {
 } from '@ant-design/icons';
 import { useStockStore, getChangeColors, COLUMN_DEFINITIONS } from '@/store/useStockStore';
 import type { AlertThreshold, ColumnKey } from '@/store/useStockStore';
-import { getQuote, searchSymbol, handleAPIError, isCNStock, searchCNSymbol } from '@/services/stockApi';
+import { getQuoteDirect, searchSymbol, handleAPIError, isCNStock, isHKStock, searchCNSymbol } from '@/services/stockApi';
 import type { SearchResult, Quote } from '@/types';
 import { formatPrice, formatPercent } from '@/utils/format';
 
 const { Title, Text } = Typography;
+
+/** 实时日期时间组件，每秒更新，上下布局展示在标题旁 */
+function CurrentDateTime() {
+  const [now, setNow] = useState(() => new Date());
+
+  useEffect(() => {
+    const timer = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const dateStr = now.toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' });
+  const timeStr = now.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 1 }}>
+      <Text style={{ fontSize: 13, fontWeight: 600, color: '#4a5a78', fontVariantNumeric: 'tabular-nums', lineHeight: 1.2 }}>
+        {dateStr}
+      </Text>
+      <Text style={{ fontSize: 11, color: '#8c9ab0', fontVariantNumeric: 'tabular-nums', lineHeight: 1.2 }}>
+        {timeStr}
+      </Text>
+    </div>
+  );
+}
 
 interface DashboardProps {
   onStockClick: (symbol: string) => void;
@@ -32,9 +56,18 @@ const formatVolume = (volume?: number): string => {
   return volume.toLocaleString();
 };
 
+/**
+ * 判断 quote 是否为"无数据占位"（price 为 0 且 change 为 0）
+ * 用于区分"数据获取失败/不支持"和"真实零价格"（后者在实际场景中不存在）
+ */
+const isPlaceholderQuote = (quote: Quote): boolean =>
+  quote.price === 0 && quote.change === 0 && quote.changePercent === 0;
+
 /** 根据 columnKey 从 quote 中取对应的显示值 */
 const getCellValue = (key: ColumnKey, symbol: string, quote: Quote | undefined): string => {
   if (!quote) return '—';
+  // 占位 quote（数据获取失败）：symbol 列正常显示，其他列显示 —
+  if (key !== 'symbol' && isPlaceholderQuote(quote)) return '—';
   switch (key) {
     case 'symbol':        return symbol;
     case 'price':         return formatPrice(quote.price);
@@ -55,9 +88,9 @@ const isChangeColumn = (key: ColumnKey): boolean =>
 
 const Dashboard = ({ onStockClick }: DashboardProps) => {
   const {
-    watchlist, quotes, error, rateLimited,
+    watchlist, quotes, symbolNames, error, rateLimited,
     setRateLimited, setError, colorMode, refreshInterval,
-    alertThresholds, visibleColumns,
+    alertThresholds, visibleColumns, indices, fetchIndices,
   } = useStockStore();
 
   const [searchQuery, setSearchQuery] = useState('');
@@ -74,9 +107,13 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
   // 记录已触发过的提醒，避免同一条件重复通知（key: symbol-type）
   const triggeredAlertsRef = useRef<Set<string>>(new Set());
 
+  // init 完成标记：用 state 而非 ref，确保 interval useEffect 能感知到变化并重新执行
+  const [initialized, setInitialized] = useState(false);
+
   useEffect(() => {
     const initDashboard = async () => {
       await useStockStore.getState().loadWatchlist();
+      await useStockStore.getState().loadSymbolNames();
       await useStockStore.getState().loadColorMode();
       await useStockStore.getState().loadRefreshInterval();
       await useStockStore.getState().loadAlertThresholds();
@@ -85,9 +122,16 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
       // 先加载当天缓存展示，同时触发后台刷新
       const hasTodayCache = await useStockStore.getState().loadQuotesCache();
       if (hasTodayCache) {
-        // 有当天缓存：先展示缓存，后台静默刷新
         setBackgroundRefreshing(true);
       }
+
+      // init 完成，触发 interval useEffect 启动
+      setInitialized(true);
+
+      // 指数数据不依赖 watchlist，在 init 完成后立即触发首次加载
+      // 原因：useEffect 的 initialized 守卫会在下一个 render 周期才执行，
+      // 而 initDashboard 里直接调用可以确保首次加载立即发起
+      useStockStore.getState().fetchIndices();
     };
     initDashboard();
   }, []);
@@ -127,9 +171,10 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
     setRefreshing(true);
     setError(null);
     try {
-      // 将 watchlist 按 A 股 / 美股分组
+      // 将 watchlist 按 A 股 / 港股 / 美股分组
       const cnSymbols = watchlist.filter(isCNStock);
-      const usSymbols = watchlist.filter((s) => !isCNStock(s));
+      const hkSymbols = watchlist.filter(isHKStock);
+      const usSymbols = watchlist.filter((s) => !isCNStock(s) && !isHKStock(s));
 
       // A 股：批量通过 AKShare 获取（一次调用）
       const cnQuotePromise: Promise<Quote[]> = cnSymbols.length > 0
@@ -138,6 +183,12 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
               const rawJson = await window.electronAPI.getCNQuote(cnSymbols.join(','));
               const parsed = JSON.parse(rawJson);
               if (Array.isArray(parsed)) {
+                // 顺便保存公司名称（A 股行情数据里有 name 字段）
+                parsed.forEach((item: any) => {
+                  if (item.symbol && item.name && item.name !== item.symbol) {
+                    useStockStore.getState().setSymbolName(item.symbol, item.name);
+                  }
+                });
                 return parsed.map((item: any): Quote => ({
                   symbol: item.symbol,
                   price: item.price ?? 0,
@@ -158,13 +209,50 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
           })()
         : Promise.resolve([]);
 
-      // 美股：通过 Finnhub 逐只获取（走限流队列）
+      // 港股：通过 AKShare 获取（一次调用，支持 XXXXX.HK 格式）
+      // 加 35 秒超时兜底：stock_hk_spot 失败时会降级到 stock_hk_daily（实测约 7 秒），
+      // 加上 stock_hk_spot 锁等待（最多 3 秒），总耗时约 10 秒，35 秒足够
+      const hkQuotePromise: Promise<Quote[]> = hkSymbols.length > 0
+        ? Promise.race([
+            (async () => {
+              try {
+                const rawJson = await window.electronAPI.getHKQuote(hkSymbols.join(','));
+                const parsed = JSON.parse(rawJson);
+                if (Array.isArray(parsed)) {
+                  // 顺便保存公司名称（港股行情数据里有 name 字段，stock_hk_spot 返回中文名）
+                  parsed.forEach((item: any) => {
+                    if (item.symbol && item.name && item.name !== item.symbol) {
+                      useStockStore.getState().setSymbolName(item.symbol, item.name);
+                    }
+                  });
+                  return parsed.map((item: any): Quote => ({
+                    symbol: item.symbol,
+                    price: item.price ?? 0,
+                    change: item.change ?? 0,
+                    changePercent: item.changePercent ?? 0,
+                    high: item.high,
+                    low: item.low,
+                    open: item.open,
+                    previousClose: item.previousClose,
+                    volume: item.volume,
+                    timestamp: new Date().toISOString(),
+                  }));
+                }
+              } catch {
+                // AKShare 不可用时静默跳过
+              }
+              return [] as Quote[];
+            })(),
+            new Promise<Quote[]>((resolve) => setTimeout(() => resolve([]), 35000)),
+          ])
+        : Promise.resolve([]);
+
+      // 美股：直接并发请求（不走限流队列），多只股票同时发出，大幅缩短刷新时间
+      // Finnhub 免费层 60次/分钟，10只以内自选股并发完全安全
       const usQuotePromises = usSymbols.map(async (symbol) => {
         try {
-          return await getQuote(symbol);
+          return await getQuoteDirect(symbol);
         } catch (err: any) {
-          const errorMessage = handleAPIError(err);
-          if (errorMessage.includes('API Key not configured')) return null;
           if (err.response?.status === 429) {
             setRateLimited(true);
             setTimeout(() => setRateLimited(false), 60000);
@@ -173,23 +261,59 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
         }
       });
 
-      const [cnQuotes, ...usResults] = await Promise.all([cnQuotePromise, ...usQuotePromises]);
-      const validQuotes = [...cnQuotes, ...usResults.filter((q): q is Quote => q !== null)];
+      const [cnQuotes, hkQuotes, ...usResults] = await Promise.all([cnQuotePromise, hkQuotePromise, ...usQuotePromises]);
+      const validQuotes = [...cnQuotes, ...hkQuotes, ...usResults.filter((q): q is Quote => q !== null)];
       useStockStore.getState().updateQuotes(validQuotes);
       validQuotes.forEach((quote) => checkAlertThreshold(quote.symbol, quote));
+
+      // 持久化有效报价到 electron-store（仅缓存 price > 0 的真实数据，避免占位 quote 污染缓存）
+      // 下次启动时 loadQuotesCache() 会恢复，A 股/港股无需等待 Python 脚本重新加载
+      if (validQuotes.some((q) => q.price > 0)) {
+        useStockStore.getState().saveQuotesCache();
+      }
+
+      // 对本次刷新后仍无数据的 symbol 写入空占位 quote，避免 UI 无限 loading
+      // 场景：港股 yfinance 限流、A 股 AKShare 不可用、Finnhub Key 缺失等
+      const fetchedSymbols = new Set(validQuotes.map((q) => q.symbol));
+      const currentQuotes = useStockStore.getState().quotes;
+      const placeholderQuotes: Quote[] = watchlist
+        .filter((s) => !fetchedSymbols.has(s) && currentQuotes[s] === undefined)
+        .map((s): Quote => ({
+          symbol: s,
+          price: 0,
+          change: 0,
+          changePercent: 0,
+          timestamp: new Date().toISOString(),
+        }));
+      if (placeholderQuotes.length > 0) {
+        useStockStore.getState().updateQuotes(placeholderQuotes);
+      }
     } catch (err: any) {
       setError(handleAPIError(err));
     } finally {
       setRefreshing(false);
+      setBackgroundRefreshing(false);
     }
   };
 
   useEffect(() => {
-    // 初始刷新：无论是否有缓存都需要刷新（有缓存时标记为后台刷新，无缓存时正常刷新）
+    // 守卫：init 未完成时不启动刷新
+    // 原因：initDashboard 异步加载 watchlist/refreshInterval 时，每次 store 状态变化都会触发本 useEffect
+    // 加守卫后，只有 init 完成（initialized=true）后才会真正启动刷新和 interval
+    if (!initialized) return;
     fetchAllQuotes();
     const interval = setInterval(fetchAllQuotes, refreshInterval * 1000);
     return () => clearInterval(interval);
-  }, [watchlist, refreshInterval]);
+  }, [initialized, watchlist, refreshInterval]);
+
+  // 指数刷新独立 useEffect：不依赖 watchlist，只跟随 refreshInterval
+  // 原因：指数是预设固定列表，与自选股无关，不应因 watchlist 变化而重复触发
+  useEffect(() => {
+    if (!initialized) return;
+    fetchIndices();
+    const interval = setInterval(fetchIndices, refreshInterval * 1000);
+    return () => clearInterval(interval);
+  }, [initialized, refreshInterval]);
 
   const handleSearch = async (query: string) => {
     setSearchQuery(query);
@@ -199,14 +323,56 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
     }
     setSearching(true);
     try {
-      // 判断是否为 A 股搜索：纯数字 或 包含中文字符
-      const isCNQuery = /^\d+$/.test(query) || /[\u4e00-\u9fa5]/.test(query);
-      let results;
-      if (isCNQuery) {
-        results = await searchCNSymbol(query);
-      } else {
-        results = await searchSymbol(query);
+      const trimmed = query.trim().toUpperCase();
+
+      // 港股格式识别：X.HK / XXXX.HK / XXXXX.HK（本地即时，零网络延迟）
+      // 用户输入 3690.HK 或 03690.HK 时立即给出结果，无需任何 API
+      if (isHKStock(trimmed) || /^\d{1,6}\.HK$/i.test(trimmed)) {
+        // 补全前导零到 5 位，与 addToWatchlist 保持一致
+        const hkMatch = trimmed.match(/^(\d+)(\.HK)$/i);
+        const normalizedSymbol = hkMatch
+          ? hkMatch[1].padStart(5, '0') + '.HK'
+          : trimmed;
+        setSearchResults([{
+          symbol: normalizedSymbol,
+          displaySymbol: normalizedSymbol,
+          description: '港股',
+          type: 'HK',
+        }]);
+        return;
       }
+
+      // A 股搜索：纯数字 或 包含中文字符 → AKShare 本地全量数据模糊匹配（快）
+      const isCNQuery = /^\d+$/.test(query) || /[\u4e00-\u9fa5]/.test(query);
+      if (isCNQuery) {
+        const results = await searchCNSymbol(query);
+        setSearchResults(results.slice(0, 5));
+        return;
+      }
+
+      // 美股：纯字母（1-5位）时本地即时识别，同时尝试 Finnhub 搜索补充描述
+      // 本地结果立即展示，Finnhub 结果（有 Key 时）异步补充
+      if (/^[A-Z]{1,5}$/.test(trimmed)) {
+        // 先立即展示本地识别结果，用户无需等待
+        setSearchResults([{
+          symbol: trimmed,
+          displaySymbol: trimmed,
+          description: '美股',
+          type: 'Common Stock',
+        }]);
+        // 异步尝试 Finnhub 搜索补充更多结果（有 Key 时才有效）
+        searchSymbol(query).then((finnhubResults) => {
+          if (finnhubResults.length > 0) {
+            setSearchResults(finnhubResults.slice(0, 5));
+          }
+        }).catch(() => {
+          // Finnhub 不可用时静默跳过，本地识别结果已展示
+        });
+        return;
+      }
+
+      // 其他格式（如 BRK.B 等含点号的美股）→ 直接走 Finnhub 搜索
+      const results = await searchSymbol(query);
       setSearchResults(results.slice(0, 5));
     } catch (err: any) {
       const errorMessage = handleAPIError(err);
@@ -218,10 +384,91 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
     }
   };
 
-  const handleAddStock = async (symbol: string) => {
+  /**
+   * 添加新股票后立即获取该股票的最新报价，不等待下一个 interval 周期
+   * 根据 symbol 类型走对应数据源（A股→AKShare，港股→yfinance，美股→Finnhub）
+   */
+  const fetchSingleQuote = async (symbol: string): Promise<void> => {
+    try {
+      let quote: Quote | null = null;
+
+      if (isCNStock(symbol)) {
+        const rawJson = await window.electronAPI.getCNQuote(symbol);
+        const parsed = JSON.parse(rawJson);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          const item = parsed[0];
+          quote = {
+            symbol: item.symbol,
+            price: item.price ?? 0,
+            change: item.change ?? 0,
+            changePercent: item.changePercent ?? 0,
+            high: item.high,
+            low: item.low,
+            open: item.open,
+            previousClose: item.previousClose,
+            volume: item.volume,
+            timestamp: new Date().toISOString(),
+          };
+        }
+      } else if (isHKStock(symbol)) {
+        const rawJson = await window.electronAPI.getHKQuote(symbol);
+        const parsed = JSON.parse(rawJson);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          const item = parsed[0];
+          quote = {
+            symbol: item.symbol,
+            price: item.price ?? 0,
+            change: item.change ?? 0,
+            changePercent: item.changePercent ?? 0,
+            high: item.high,
+            low: item.low,
+            open: item.open,
+            previousClose: item.previousClose,
+            volume: item.volume,
+            timestamp: new Date().toISOString(),
+          };
+        }
+      } else {
+        quote = await getQuoteDirect(symbol);
+      }
+
+      if (quote) {
+        useStockStore.getState().updateQuotes([quote]);
+      } else {
+        // 数据获取失败（限流/网络不通）时写入占位 quote，避免 UI 一直显示 —
+        // 下一个 interval 周期会重试，占位 quote 会被真实数据覆盖
+        const existingQuote = useStockStore.getState().quotes[symbol];
+        if (!existingQuote) {
+          useStockStore.getState().updateQuotes([{
+            symbol,
+            price: 0,
+            change: 0,
+            changePercent: 0,
+            timestamp: new Date().toISOString(),
+          }]);
+        }
+      }
+    } catch {
+      // 单只股票获取失败时静默跳过，不影响已有数据
+    }
+  };
+
+  const handleAddStock = async (symbol: string, name?: string) => {
     await useStockStore.getState().addToWatchlist(symbol);
+    // 保存公司名称（从搜索结果的 description 字段获取）
+    // 注意：必须与 addToWatchlist 里的港股补全逻辑保持一致，否则 key 不匹配
+    if (name && name.trim() && name !== '港股' && name !== '美股') {
+      let normalizedSymbol = symbol.toUpperCase().trim();
+      const hkMatch = normalizedSymbol.match(/^(\d{1,4})(\.HK)$/i);
+      if (hkMatch) {
+        normalizedSymbol = hkMatch[1].padStart(5, '0') + hkMatch[2].toUpperCase();
+      }
+      await useStockStore.getState().setSymbolName(normalizedSymbol, name.trim());
+    }
     setSearchQuery('');
     setSearchResults([]);
+    // 添加成功后立即获取该股票最新报价，无需等待下一个 interval 周期
+    fetchSingleQuote(symbol);
   };
 
   const handleRemoveStock = async (symbol: string) => {
@@ -240,13 +487,18 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
 
   return (
     <div style={{ maxWidth: 1400, margin: '0 auto' }}>
-      {/* ── 页面标题栏 ── */}
+      {/* ── 页面标题栏（含右侧指数卡片）── */}
       <div style={{ marginBottom: 20 }}>
-        <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
+          {/* 左侧：标题 + 副标题 + 操作按钮 */}
           <div>
-            <Title level={2} style={{ margin: 0, fontWeight: 700, letterSpacing: '-0.03em', fontSize: 26 }}>
-              自选股
-            </Title>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <Title level={2} style={{ margin: 0, fontWeight: 700, letterSpacing: '-0.03em', fontSize: 26, lineHeight: 1 }}>
+                自选股
+              </Title>
+              <div style={{ width: 1, height: 28, background: 'rgba(100,120,160,0.2)', borderRadius: 1 }} />
+              <CurrentDateTime />
+            </div>
             <Text style={{ color: '#6b7fa8', fontSize: 13, marginTop: 2, display: 'block' }}>
               {watchlist.length} 只股票 · 每 {refreshInterval >= 60 ? `${refreshInterval / 60} 分钟` : `${refreshInterval} 秒`} 自动刷新
               {backgroundRefreshing && (
@@ -259,25 +511,85 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
                 </Tag>
               )}
             </Text>
+            {watchlist.length > 0 && (
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 10 }}>
+                <Tag icon={<RiseOutlined />} color="error" style={{ borderRadius: 20, padding: '2px 12px', fontSize: 13, fontWeight: 600 }}>
+                  {gainers} 涨
+                </Tag>
+                <Tag icon={<FallOutlined />} color="success" style={{ borderRadius: 20, padding: '2px 12px', fontSize: 13, fontWeight: 600 }}>
+                  {losers} 跌
+                </Tag>
+                <Button
+                  icon={<ReloadOutlined spin={refreshing} />}
+                  onClick={() => fetchAllQuotes()}
+                  loading={refreshing}
+                  style={{ borderRadius: 20, fontWeight: 500 }}
+                >
+                  刷新
+                </Button>
+              </div>
+            )}
           </div>
-          {watchlist.length > 0 && (
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-              <Tag icon={<RiseOutlined />} color="error" style={{ borderRadius: 20, padding: '2px 12px', fontSize: 13, fontWeight: 600 }}>
-                {gainers} 涨
-              </Tag>
-              <Tag icon={<FallOutlined />} color="success" style={{ borderRadius: 20, padding: '2px 12px', fontSize: 13, fontWeight: 600 }}>
-                {losers} 跌
-              </Tag>
-              <Button
-                icon={<ReloadOutlined spin={refreshing} />}
-                onClick={() => fetchAllQuotes()}
-                loading={refreshing}
-                style={{ borderRadius: 20, fontWeight: 500 }}
-              >
-                刷新
-              </Button>
-            </div>
-          )}
+
+          {/* 右侧：关键指数卡片（始终展示预设 6 个，数据未到时用占位符）*/}
+          {(() => {
+            // 预设指数列表，顺序固定
+            const PRESET_INDICES = [
+              { symbol: '000001.SH', name: '上证指数' },
+              { symbol: '.IXIC',     name: '纳斯达克' },
+              { symbol: 'HSTECH',    name: '恒生科技' },
+              { symbol: '000688.SH', name: '科创综指' },
+              { symbol: 'HSI',       name: '恒生指数' },
+              { symbol: '.INX',      name: '标普500'  },
+            ];
+            // 用 symbol 建立快速查找 map
+            const indexDataMap = new Map(indices.map((idx) => [idx.symbol, idx]));
+
+            return (
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                {PRESET_INDICES.map(({ symbol, name }) => {
+                  const data = indexDataMap.get(symbol);
+                  const hasData = !!data;
+                  const isUp = hasData && data.change >= 0;
+                  const indexColor = hasData ? (isUp ? upColor : downColor) : '#c0cce0';
+                  const sign = hasData && isUp ? '+' : '';
+
+                  return (
+                    <div
+                      key={symbol}
+                      style={{
+                        padding: '10px 16px',
+                        borderRadius: 14,
+                        background: 'rgba(255,255,255,0.7)',
+                        backdropFilter: 'blur(8px)',
+                        border: '1px solid rgba(79, 110, 247, 0.1)',
+                        boxShadow: '0 2px 8px rgba(0,0,0,0.05)',
+                        minWidth: 100,
+                        textAlign: 'center',
+                      }}
+                    >
+                      <div style={{ fontSize: 11, color: '#8a9cc8', fontWeight: 600, marginBottom: 4 }}>
+                        {name}
+                      </div>
+                      <div style={{ fontSize: 15, fontWeight: 800, color: hasData ? '#0f1a2e' : '#c0cce0', letterSpacing: '-0.02em', lineHeight: 1.2 }}>
+                        {hasData ? data.price.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : '—'}
+                      </div>
+                      <div style={{ fontSize: 11, fontWeight: 600, color: indexColor, marginTop: 3 }}>
+                        {hasData ? (
+                          <>
+                            {sign}{data.change.toFixed(2)}
+                            <span style={{ marginLeft: 4 }}>
+                              {sign}{data.changePercent.toFixed(2)}%
+                            </span>
+                          </>
+                        ) : '— —%'}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })()}
         </div>
       </div>
 
@@ -319,7 +631,7 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
                 <div
                   key={result.symbol}
                   className="search-result-item"
-                  onClick={() => handleAddStock(result.symbol)}
+                  onClick={() => handleAddStock(result.symbol, result.description)}
                   style={{
                     display: 'flex',
                     alignItems: 'center',
@@ -452,6 +764,15 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
                     >
                       {quote === undefined && col.key !== 'symbol' ? (
                         <Spin indicator={<LoadingOutlined style={{ fontSize: 12, color: '#4f6ef7' }} spin />} />
+                      ) : isSymbolCol ? (
+                        <div>
+                          <div>{value}</div>
+                          {symbolNames[symbol] && (
+                            <div style={{ fontSize: 11, fontWeight: 400, color: '#8a9cc8', marginTop: 1 }}>
+                              {symbolNames[symbol]}
+                            </div>
+                          )}
+                        </div>
                       ) : (
                         value
                       )}

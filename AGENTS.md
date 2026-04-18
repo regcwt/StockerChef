@@ -24,8 +24,13 @@
 - **这是什么**：macOS 桌面股票看板应用，基于 Electron + React + TypeScript 构建
 - **核心功能**：自选股实时行情监控（10s 轮询）、股票新闻聚合、真实技术分析（RSI/SMA，基于历史 K 线数据）
 - **数据来源**：
-  - 实时报价：Finnhub 免费 API（仅支持美股，60次/分钟限额）
-  - 历史 K 线：AKShare（优先，免费无 Key）→ yfinance（降级备选）→ 随机模拟（两者均不可用时）
+  - A 股实时行情：Tushare Pro（有 Token 时优先）→ AKShare stock_zh_a_hist_tx（腾讯财经，降级）
+  - 港股实时行情：AKShare stock_hk_spot（新浪财经，10min 缓存）→ 降级 stock_hk_daily（stock_hk_spot 在部分网络环境下不可用，降级链总耗时约 10s，前端超时设为 35s）
+  - 美股实时报价：Finnhub 免费 API（仅支持美股，60次/分钟限额）
+  - A 股历史 K 线：Tushare daily（有 Token）→ AKShare stock_zh_a_hist_tx（腾讯财经，降级）
+  - 港股历史 K 线：AKShare stock_hk_daily（新浪财经）
+  - 美股历史 K 线：yfinance → 随机模拟（网络不通时）
+  - **Python 数据层**：`scripts/providers/` 包（多 Provider 类架构，参考 TradingAgents-CN）
 - **持久化**：自选股列表通过 IPC 存储在 `electron-store`，路径 `~/Library/Application Support/stocker-chef/`
 - **⚠️ 重要限制**：历史数据依赖网络可用性，网络不通时技术分析降级为随机模拟数据；仅支持 macOS 打包
 
@@ -190,11 +195,19 @@ export const darkTheme: ThemeConfig = {
 **当前 IPC 通道**：
 | 通道名 | 方向 | 参数 | 返回值 |
 |--------|------|------|--------|
+| `window-minimize` | renderer → main | — | void |
+| `window-maximize` | renderer → main | — | void |
+| `window-close` | renderer → main | — | void |
 | `store-get` | renderer → main | `key: string` | `unknown`（存储的值） |
 | `store-set` | renderer → main | `key: string, value: unknown` | `true` |
 | `settings-get` | renderer → main | `key: string` | `unknown`（用户设置值） |
 | `settings-set` | renderer → main | `key: string, value: unknown` | `true` |
 | `stock-get-history` | renderer → main | `symbol: string, startDate: string, endDate: string` | JSON 字符串 |
+| `stock-get-cn-quote` | renderer → main | `symbols: string`（逗号分隔 6 位代码） | JSON 字符串（`Quote[]`） |
+| `stock-search-cn` | renderer → main | `query: string` | JSON 字符串（`SearchResult[]`） |
+| `stock-get-hk-quote` | renderer → main | `symbols: string`（逗号分隔 XXXXX.HK） | JSON 字符串（`Quote[]`） |
+| `stock-get-indices` | renderer → main | — | JSON 字符串（`IndexQuote[]`） |
+| `show-notification` | renderer → main | `title: string, body: string` | void |
 
 **settings 命名空间**：`settings-get/set` 在 electron-store 中以 `settings.{key}` 存储，与 `watchlist` 隔离。当前使用的 key：
 - `settings.finnhubApiKey` — Finnhub API Key（用户在 Settings 页面配置）
@@ -206,9 +219,15 @@ export const darkTheme: ThemeConfig = {
 **职责**：通过 `contextBridge` 将 IPC 通道安全暴露给 renderer，是 main 进程和 renderer 进程之间的唯一合法通信桥梁。
 
 **暴露的 API**：
+- `window.electronAPI.minimizeWindow/maximizeWindow/closeWindow()` — 自定义标题栏窗口控制
 - `window.electronAPI.getStore(key)` / `window.electronAPI.setStore(key, value)` — watchlist 等通用存储
 - `window.electronAPI.getSettings(key)` / `window.electronAPI.setSettings(key, value)` — 用户设置（Finnhub Key 等）
 - `window.electronAPI.getStockHistory(symbol, startDate, endDate)` — 历史 K 线数据（调用 Python 脚本）
+- `window.electronAPI.getCNQuote(symbols)` — A 股实时行情（AKShare，逗号分隔代码）
+- `window.electronAPI.searchCNSymbol(query)` — A 股搜索（AKShare 全量数据模糊匹配）
+- `window.electronAPI.getHKQuote(symbols)` — 港股实时行情（AKShare stock_hk_spot，10min 缓存）
+- `window.electronAPI.getIndices()` — 关键指数行情（上证/科创/纳斯达克/标普/恒生/恒生科技）
+- `window.electronAPI.showNotification(title, body)` — 系统通知（股价阈值提醒）
 
 **不负责**：业务逻辑，只做透传。新增 IPC 通道时，必须同时修改 `main.ts`（注册 handler）和 `preload.ts`（暴露方法）。
 
@@ -234,16 +253,26 @@ export const darkTheme: ThemeConfig = {
 
 ### `src/store/useStockStore.ts` — 全局状态
 
-**职责**：管理自选股列表（`watchlist`）和实时报价缓存（`quotes`），负责与 `electron-store` 的读写同步。
+**职责**：管理自选股列表（`watchlist`）、实时报价缓存（`quotes`）、关键指数（`indices`），负责与 `electron-store` 的读写同步。
 
 **状态字段**：
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `watchlist` | `string[]` | 自选股代码列表（大写） |
 | `quotes` | `Record<string, Quote>` | symbol → 最新报价的映射 |
+| `symbolNames` | `Record<string, string>` | symbol → 中文名称的映射（持久化） |
+| `indices` | `IndexQuote[]` | 关键指数行情列表（6 个预设指数） |
 | `loading` | `boolean` | 全局加载状态 |
 | `error` | `string \| null` | 全局错误信息 |
 | `rateLimited` | `boolean` | API 限流标志 |
+| `colorMode` | `'cn' \| 'us'` | 涨跌色风格（cn=红涨绿跌，us=绿涨红跌） |
+| `refreshInterval` | `number` | 自动刷新间隔（秒，默认 300） |
+| `alertThresholds` | `Record<string, AlertThreshold>` | symbol → 价格/涨幅提醒阈值 |
+| `visibleColumns` | `ColumnKey[]` | 自选股列表可见列配置 |
+
+**关键 action**：
+- `fetchIndices()` — 调用 `window.electronAPI.getIndices()` 获取指数行情，解析 JSON 后更新 `indices`
+- `loadWatchlist()` / `saveWatchlist()` — 从 electron-store 读写自选股列表
 
 **不负责**：新闻数据（由 `useStockNews` hook 管理）、技术分析数据（组件本地状态）。
 
@@ -261,13 +290,30 @@ export const darkTheme: ThemeConfig = {
 
 ### `src/pages/Dashboard.tsx` — 自选股看板
 
-**职责**：展示自选股列表、搜索添加股票、批量刷新报价（10s 定时 + 手动触发）。
+**职责**：展示自选股列表、搜索添加股票、批量刷新报价（定时 + 手动触发）、展示 6 个关键指数卡片。
 
 **关键行为**：
-- 组件挂载时调用 `loadWatchlist()` 从 electron-store 加载数据
-- 每 10s 对所有 watchlist 中的 symbol 并发请求报价（通过 `Promise.all`，但每个请求仍走限流队列）
+- 组件挂载时依次调用 `loadWatchlist()`、`loadSymbolNames()`、`loadColorMode()`、`loadRefreshInterval()`、`loadAlertThresholds()`、`loadVisibleColumns()` 从 electron-store 加载数据
+- 初始化完成后立即调用一次 `fetchIndices()`，之后与 `fetchAllQuotes` 同步触发（同一个 interval）
+- 刷新间隔由用户在 Settings 中配置（`refreshInterval` 字段，默认 300s），不再固定 10s
 - 点击股票卡片触发 `onStockClick(symbol)` prop 回调，由 App.tsx 切换到 Analysis tab
 - 接受 `onNavigateToSettings?: () => void` prop，用于从搜索提示跳转到 Settings tab
+
+**指数卡片区域**：
+- 始终渲染 6 个预设指数卡片（`PRESET_INDICES` 数组），数据未到时用 `—` 占位
+- 展示顺序（固定）：上证指数 → 纳斯达克 → 恒生科技 → 科创综指 → 恒生指数 → 标普500
+- 数据来源：`useStockStore` 的 `indices` 字段，通过 `fetchIndices()` 更新
+
+```typescript
+const PRESET_INDICES = [
+  { symbol: '000001.SH', name: '上证指数' },
+  { symbol: '.IXIC',     name: '纳斯达克' },
+  { symbol: 'HSTECH',    name: '恒生科技' },
+  { symbol: '000688.SH', name: '科创综指' },
+  { symbol: 'HSI',       name: '恒生指数' },
+  { symbol: '.INX',      name: '标普500'  },
+];
+```
 
 **Finnhub Key 缺失时的行为**：
 - 搜索框输入 → 捕获 "API Key not configured" 错误 → 设置 `finnhubKeyMissing = true` → 搜索框下方显示友好提示（含跳转 Settings 链接）
@@ -314,6 +360,33 @@ export const darkTheme: ThemeConfig = {
 
 **⚠️ 已知 Bug**：`formatMarketCap` 函数将传入值直接按美元做 T/B/M/K 换算，但 Finnhub `getProfile()` 返回的 `marketCapitalization` 单位是**百万美元**。因此当前展示的市值数字偏小 100 万倍（如实际市值 3 万亿美元的公司，显示为 `$3.00M` 而非 `$3.00T`）。详见 `docs/known-issues/market-cap-unit-mismatch.md`。
 
+### `src/components/KLineChart.tsx` — K 线图组件
+
+**职责**：基于 lightweight-charts v5 渲染 K 线主图 + 成交量副图，供 `Analysis.tsx` 使用。
+
+**关键配置**：
+- 涨跌色：A 股风格（红涨 `#ef4444` / 绿跌 `#22c55e`）
+- 时间轴日期格式：`YYYYMMDD`（如 `20260418`），通过 `tickMarkFormatter` 和 `localization.timeFormatter` 同时配置
+- 成交量副图：独立 `priceScaleId: 'volume'`，占图表下方 25% 空间
+
+**⚠️ lightweight-charts v5 的 time 类型**：
+- `setData()` 传入的 `time` 字段是 `"YYYY-MM-DD"` 格式字符串
+- `tickMarkFormatter` 和 `localization.timeFormatter` 回调收到的 `time` 参数是 **`BusinessDay` 对象** `{ year: number, month: number, day: number }`，**不是**字符串也**不是** Unix 时间戳
+- 格式化时必须用 `(time as { year, month, day })` 解构，不能用 `new Date(time * 1000)`（会得到 NaN）
+
+```typescript
+// ✅ 正确写法
+tickMarkFormatter: (time: unknown) => {
+  const t = time as { year: number; month: number; day: number };
+  return `${t.year}${String(t.month).padStart(2, '0')}${String(t.day).padStart(2, '0')}`;
+}
+
+// ❌ 错误写法（time 不是时间戳）
+tickMarkFormatter: (time: number) => {
+  const date = new Date(time * 1000); // NaN！
+}
+```
+
 ### `src/types/index.ts` — 核心类型定义
 
 **职责**：定义所有跨模块共享的 TypeScript 接口。新增数据结构时必须在此文件定义类型，不要在组件文件内定义共享类型。
@@ -325,17 +398,22 @@ export const darkTheme: ThemeConfig = {
 详见 `src/types/index.ts`，核心类型速查：
 
 ```typescript
-Quote       // 实时报价：symbol, price, change, changePercent, high, low, open, previousClose, timestamp
-Stock       // 股票基本信息：symbol, name, price, change, changePercent, marketCap?, description?
-NewsItem    // 新闻条目：title, source, publishedAt, url, summary?
-AnalysisResult  // 技术分析（模拟）：symbol, rsi?, sma20?, sma50?, sma200?, recommendation, summary
-SearchResult    // 搜索结果：symbol, description, displaySymbol, type
-StockProfile    // Finnhub 公司档案（API 原始格式）：name, exchange, marketCapitalization, country, industry...
+Quote             // 实时报价：symbol, price, change, changePercent, volume?, high?, low?, open?, previousClose?, timestamp
+Stock             // 股票基本信息：symbol, name, price, change, changePercent, marketCap?, description?
+NewsItem          // 新闻条目：title, source, publishedAt, url, summary?
+AnalysisResult    // 技术分析：symbol, rsi?, sma20?, sma50?, sma200?, recommendation, summary
+SearchResult      // 搜索结果：symbol, description, displaySymbol, type
+StockProfile      // Finnhub 公司档案（API 原始格式）：name, exchange, marketCapitalization, country, industry...
+HistoricalDataPoint  // K 线数据点：date, open, high, low, close, volume
+HistoricalDataResult // K 线结果：data, source('akshare'|'yfinance'|'simulated'), error?
+IndexQuote        // 关键指数行情：symbol, name, price, change, changePercent
+StockQuestion     // 用户问题记录：id, symbol, question, createdAt
 ```
 
 **类型扩展规则**：
 - 新增可选字段用 `?` 标注，不要破坏现有接口
 - `AnalysisResult.recommendation` 是联合类型 `'Buy' | 'Sell' | 'Hold'`，不要改为 string
+- `HistoricalDataResult.source` 是联合类型 `'akshare' | 'yfinance' | 'simulated'`，不要改为 string
 
 ---
 
@@ -373,6 +451,25 @@ axios → Finnhub API (https://finnhub.io/api/v1)
   │
   ▼
 返回数据 → 更新 Store / Hook 本地状态 → 触发 React 重渲染
+
+─────────────────────────────────────────
+
+Dashboard 初始化 / 定时刷新（与 fetchAllQuotes 同一 interval）
+  │  fetchIndices()
+  ▼
+window.electronAPI.getIndices()  ←── preload.ts contextBridge
+  │
+  ▼
+IPC: stock-get-indices  ──→  main.ts → execFile(python3, main.py --action get_indices)
+  │
+  ▼
+scripts/main.py handle_get_indices()
+  ├── A 股指数（上证/科创）：ak.stock_zh_index_daily() 取最近两日计算涨跌
+  ├── 港股指数（恒生/恒生科技）：ak.stock_hk_index_spot_sina()
+  └── 美股指数（纳斯达克/标普）：ak.index_us_stock_sina() 取最近两日计算涨跌
+  │  ⚠️ 调用 AKShare 前将 sys.stdout 重定向到 sys.stderr，防止 tqdm 污染 JSON 输出
+  ▼
+返回 JSON 字符串（IndexQuote[]）→ store.indices → Dashboard 指数卡片渲染
 ```
 
 ---
@@ -404,6 +501,74 @@ axios → Finnhub API (https://finnhub.io/api/v1)
 **根因**：`analysis` 状态在组件卸载时不会重置（React 组件重新挂载时状态初始化为 `null`，但路由切换后再切回同一 symbol 时组件会重新挂载，所以实际影响有限）。
 
 **规避**：每次点击"Technical Analysis"按钮都会重新生成，不要依赖缓存的 `analysis` 状态。
+
+### BUG-008：AKShare tqdm 进度条污染 stdout 导致 JSON.parse 失败（已修复）
+
+**现象**：指数卡片始终显示占位符（`—`），即使 Python 脚本数据正常。
+
+**根因**：`ak.stock_zh_index_spot_sina()` 等 AKShare 接口内部使用 tqdm 进度条，默认输出到 stdout。`execFile` 的 `stdout` 回调拿到的是 `进度条文本 + JSON` 混合内容，`JSON.parse` 失败，被 catch 静默掉，`indices` 永远是 `[]`。
+
+**修复**：在 `handle_get_indices()` 里，调用 AKShare 前用 `try/finally` 临时将 `sys.stdout` 重定向到 `sys.stderr`，确保 stdout 只有纯 JSON 输出。
+
+**规避原则**：所有调用 AKShare 接口的 Python 函数，如果其输出会被 `execFile` 的 stdout 捕获并 `JSON.parse`，必须在调用前将 `sys.stdout` 重定向到 `sys.stderr`，并在 `finally` 里恢复。
+
+### BUG-009：`ak.stock_zh_index_spot_sina()` 在部分网络环境下返回 HTML 错误页（已修复）
+
+**现象**：A 股指数（上证指数、科创综指）始终缺失，Python 脚本报 `Can not decode value starting with character '<'`。
+
+**根因**：新浪财经接口 `stock_zh_index_spot_sina` 在部分网络环境下返回 HTML 错误页而非数据。
+
+**修复**：改用 `ak.stock_zh_index_daily(symbol='sh000001')` 取最近两日日线数据计算涨跌（与美股指数处理方式一致，更稳定）。
+
+**规避原则**：AKShare 的 `_spot_sina` 系列接口依赖新浪财经，网络不稳定时容易返回 HTML。优先使用 `_daily` 系列接口作为备选。
+
+### BUG-010：AKShare tqdm 污染 stdout + 东方财富接口不可用导致 A 股数据完全无法获取（已修复）
+
+**现象**：添加 A 股（6 位纯数字代码，如 000001、600519）到自选股后，行情始终显示 `—`，不显示任何价格数据。
+
+**根因**：两个叠加的 Bug：
+
+1. **tqdm stdout 污染**：`main.py` 的 `handle_cn_quote`、`handle_hk_quote` 等函数调用 AKShare 时，AKShare 内部的 `tqdm` 进度条默认输出到 `stdout`，导致前端 `execFile` 收到的不是纯 JSON，而是 `进度条文本 + JSON` 混合内容，`JSON.parse` 抛出异常，A 股数据完全无法获取。（`handle_get_indices` 已有保护，但其他 handle 函数没有。）
+
+2. **东方财富接口不可用**：`CnAKShareProvider._fetch_single_quote()` 使用 `stock_zh_a_hist`（东方财富接口），该接口在部分网络环境下持续返回 `RemoteDisconnected('Remote end closed connection without response')`，重试 3 次后仍失败，返回空数组。
+
+3. **`get_quotes()` 被 `_load_stock_list()` 阻塞**：`get_quotes()` 先调用 `_load_stock_list()` 获取股票名称映射，而 `stock_info_a_code_name()` 内部有 tqdm 且在部分网络下超时，导致整个行情获取被阻塞。
+
+**修复**：
+- `scripts/main.py`：在 `handle_cn_quote`、`handle_cn_search`、`handle_hk_quote`、`handle_hk_search`、`handle_us_quote`、`handle_history` 所有 handle 函数中统一加 `sys.stdout = sys.stderr` 重定向保护（与 `handle_get_indices` 一致），`finally` 块恢复。
+- `scripts/providers/cn_akshare.py`：
+  - `_fetch_single_quote()` 改用 `stock_zh_a_hist_tx`（腾讯财经接口），需要添加 `sz/sh/bj` 市场前缀（深交所 `sz`，上交所 `sh`，北交所 `bj`）。
+  - `get_quotes()` 改为仅使用已有缓存（不主动触发 `_load_stock_list()` 网络请求），名称获取失败时降级为使用代码作为名称。
+  - `search()` 改为缓存优先策略：有缓存时模糊匹配，无缓存时对纯数字查询直接验证代码有效性。
+
+**规避原则**：
+- 所有调用 AKShare 接口的 Python 函数，输出会被 `execFile` stdout 捕获时，必须先将 `sys.stdout` 重定向到 `sys.stderr`，并在 `finally` 里恢复。
+- A 股实时行情优先使用 `stock_zh_a_hist_tx`（腾讯财经），不使用 `stock_zh_a_hist`（东方财富，网络可达性差）。
+- `get_quotes()` 不应在关键路径上调用可能超时的辅助接口（如股票列表），名称缺失时用代码代替。
+
+### BUG-007：Python 脚本历史 K 线返回数组格式，但前端期望对象格式（已修复）
+
+**现象**：K 线图 Tab 显示空白，数据来源标注为"模拟数据"，即使 AKShare/yfinance 可用。
+
+**根因**：`yfinance_fetch.py` 的历史 K 线路由（美股/港股）直接返回数组格式 `[{date, open, high, low, close, volume, source}, ...]`，但 `getHistoricalData()` 只处理了对象格式 `{data: [...], source: '...'}` 的响应，导致 `parsed.data` 为 `undefined`，最终返回 `{ data: [], source: 'simulated' }`。
+
+**修复**：在 `src/services/stockApi.ts` 的 `getHistoricalData()` 中新增对数组格式的解析分支，从第一条数据的 `source` 字段提取数据来源。
+
+**规避原则**：Python 脚本返回格式有两种，修改 Python 脚本时必须保持格式一致，或在前端同时兼容两种格式。
+
+### BUG-010：lightweight-charts v5 的 `tickMarkFormatter` 收到的 time 是 BusinessDay 对象而非时间戳（已修复）
+
+**现象**：K 线图底部时间轴刻度显示 `NaNNaNNaN`，crosshair 悬停显示 `10 4月 '26 00:00`，而非期望的 `20260418` 格式。
+
+**根因**：
+1. `tickMarkFormatter` 的 `time` 参数类型在 lightweight-charts v5 中是 `BusinessDay` 对象 `{ year, month, day }`，不是 Unix 时间戳，用 `new Date(time * 1000)` 会得到 NaN
+2. crosshair 悬停日期需要通过 `localization.timeFormatter` 单独配置，`tickMarkFormatter` 只控制时间轴刻度，两者互相独立
+
+**修复**：
+- `tickMarkFormatter` 和 `localization.timeFormatter` 均改为解构 `BusinessDay` 对象：`(time as { year, month, day })` 后拼接 `YYYYMMDD`
+- 同时开启 `timeVisible: true`（之前为 `false`，导致底部根本不显示日期）
+
+**规避原则**：使用 lightweight-charts v5 时，所有时间格式化回调（`tickMarkFormatter`、`localization.timeFormatter`）收到的 `time` 参数类型是 `BusinessDay | UTCTimestamp`，日线数据传入的是 `BusinessDay`，必须按对象解构处理，不能当数字用。
 
 ### BUG-004：TypeScript 编译存在已知错误（已修复）
 
@@ -605,6 +770,9 @@ grep "electronAPI" src/types/electron.d.ts
 - [ ] 如果修改了 watchlist 相关逻辑，是否确认 `'watchlist'` key 未被更改？
 - [ ] 如果新增了模拟数据，是否在 UI 上添加了免责声明？
 - [ ] 新增的 Hook 是否在组件卸载时清理了 interval / 取消了异步操作？
+- [ ] 调用 AKShare 的 Python 函数，是否在调用前将 `sys.stdout` 重定向到 `sys.stderr`（防止 tqdm 污染 JSON 输出）？
+- [ ] 使用 lightweight-charts v5 的时间格式化回调（`tickMarkFormatter`、`localization.timeFormatter`）时，是否按 `BusinessDay` 对象 `{ year, month, day }` 解构，而非当作数字或字符串处理？
+- [ ] Dashboard 的指数卡片顺序是否与 `PRESET_INDICES` 数组一致（上证→纳斯达克→恒生科技→科创→恒生→标普）？
 
 ---
 

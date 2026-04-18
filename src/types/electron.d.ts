@@ -29,6 +29,19 @@ export interface ElectronAPI {
    * 返回 JSON 字符串：SearchResult[] 或 { error, message }
    */
   searchCNSymbol: (query: string) => Promise<string>;
+  /**
+   * 获取港股实时行情（AKShare stock_hk_spot 新浪财经，支持 XXXXX.HK 格式）
+   * 数据源：ak.stock_hk_spot()，10分钟进程级缓存 + threading.Lock 防并发
+   * symbols: 逗号分隔的港股代码，如 "03690.HK,00700.HK"
+   * 返回 JSON 字符串：Quote[] 或 { error, message }
+   */
+  getHKQuote: (symbols: string) => Promise<string>;
+  /**
+   * 获取关键指数行情（上证、科创综指、纳斯达克、标普500、恒生、恒生科技）
+   * 数据源：A 股指数 → AKShare stock_zh_index_spot_sina；港美指数 → yfinance
+   * 返回 JSON 字符串：IndexQuote[] 或 { error, message }
+   */
+  getIndices: () => Promise<string>;
 }
 
 declare global {

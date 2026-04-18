@@ -1,12 +1,13 @@
 import { useState, useEffect, useRef } from 'react';
-import { Card, Tabs, Spin, Alert, Button, Modal, Typography, Space, List, Input, Tooltip } from 'antd';
+import { Card, Tabs, Spin, Alert, Button, Modal, Typography, Space, List, Input, Tooltip, Radio } from 'antd';
 import { BarChartOutlined, RiseOutlined, FallOutlined, LinkOutlined, ClockCircleOutlined, DeleteOutlined, SendOutlined, MessageOutlined } from '@ant-design/icons';
 import { useStockQuote } from '@/hooks/useStockQuote';
 import { useStockNews } from '@/hooks/useStockNews';
 import { getProfile, getHistoricalData, handleAPIError } from '@/services/stockApi';
 import { useStockStore, getChangeColors } from '@/store/useStockStore';
-import type { Stock, NewsItem, AnalysisResult, StockQuestion } from '@/types';
+import type { Stock, NewsItem, AnalysisResult, StockQuestion, HistoricalDataPoint } from '@/types';
 import { formatPrice, formatPercent, formatMarketCap, formatDate } from '@/utils/format';
+import KLineChart from '@/components/KLineChart';
 
 const { Title, Text, Link } = Typography;
 /** Single stat cell used in the details grid */
@@ -96,7 +97,7 @@ interface AnalysisProps {
 }
 
 const Analysis = ({ initialSymbol }: AnalysisProps) => {
-  const { watchlist, refreshInterval, questions, loadQuestions, addQuestion, deleteQuestion } = useStockStore();
+  const { watchlist, refreshInterval, questions, loadQuestions, addQuestion, deleteQuestion, symbolNames } = useStockStore();
   // 当前选中的股票 symbol，优先使用从 Dashboard 传入的 initialSymbol
   const [symbol, setSymbol] = useState<string | undefined>(initialSymbol || watchlist[0]);
 
@@ -115,10 +116,45 @@ const Analysis = ({ initialSymbol }: AnalysisProps) => {
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
   const [analysisLoading, setAnalysisLoading] = useState(false);
 
+  // ── K 线图状态 ────────────────────────────────────────────────────────
+  const [klineData, setKlineData] = useState<HistoricalDataPoint[]>([]);
+  const [klineLoading, setKlineLoading] = useState(false);
+  const [klineError, setKlineError] = useState<string | null>(null);
+  const [klineSource, setKlineSource] = useState<string>('');
+  /** 时间范围：1M / 3M / 6M / 1Y */
+  const [klineRange, setKlineRange] = useState<'1M' | '3M' | '6M' | '1Y'>('3M');
+
   // ── 问答区域状态 ──────────────────────────────────────────────────────
   const [questionInput, setQuestionInput] = useState('');
   const [selectedQuestion, setSelectedQuestion] = useState<StockQuestion | null>(null);
   const questionInputRef = useRef<HTMLTextAreaElement>(null);
+
+  // ── K 线图数据加载 ────────────────────────────────────────────────────
+  const rangeTodays: Record<string, number> = { '1M': 30, '3M': 90, '6M': 180, '1Y': 365 };
+
+  const loadKlineData = async (targetSymbol: string, range: '1M' | '3M' | '6M' | '1Y') => {
+    setKlineLoading(true);
+    setKlineError(null);
+    try {
+      const endDate = new Date().toISOString().split('T')[0];
+      const startDate = new Date(Date.now() - rangeTodays[range] * 24 * 60 * 60 * 1000)
+        .toISOString()
+        .split('T')[0];
+      const result = await getHistoricalData(targetSymbol, startDate, endDate);
+      setKlineData(result.data);
+      setKlineSource(result.source);
+    } catch (err: any) {
+      setKlineError(handleAPIError(err));
+    } finally {
+      setKlineLoading(false);
+    }
+  };
+
+  // symbol 或时间范围变化时重新加载 K 线数据
+  useEffect(() => {
+    if (!symbol) return;
+    loadKlineData(symbol, klineRange);
+  }, [symbol, klineRange]);
 
   // 加载历史问题
   useEffect(() => {
@@ -553,8 +589,10 @@ const Analysis = ({ initialSymbol }: AnalysisProps) => {
                   <Title level={2} style={{ margin: 0, fontWeight: 800, letterSpacing: '-0.03em', lineHeight: 1.1 }}>
                     {symbol}
                   </Title>
-                  {profile && (
-                    <Text style={{ color: '#6b7fa8', fontSize: 13 }}>{profile.name}</Text>
+                  {(profile?.name || symbolNames[symbol]) && (
+                    <Text style={{ color: '#6b7fa8', fontSize: 13 }}>
+                      {profile?.name || symbolNames[symbol]}
+                    </Text>
                   )}
                 </div>
               </div>
@@ -654,9 +692,62 @@ const Analysis = ({ initialSymbol }: AnalysisProps) => {
         styles={{ body: { padding: '8px 24px 24px' } }}
       >
         <Tabs
-          defaultActiveKey="details"
+          defaultActiveKey="kline"
           size="large"
           items={[
+            {
+              key: 'kline',
+              label: (
+                <span style={{ fontWeight: 600, fontSize: 14 }}>📈 K 线图</span>
+              ),
+              children: (
+                <div>
+                  {/* 时间范围切换 */}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+                    <div style={{ fontSize: 12, color: '#94a3b8' }}>
+                      {klineSource && !klineLoading && (
+                        <span>
+                          数据来源：
+                          <span style={{
+                            color: klineSource === 'simulated' ? '#f59e0b' : '#22c55e',
+                            fontWeight: 600,
+                          }}>
+                            {klineSource === 'akshare' ? 'AKShare' : klineSource === 'yfinance' ? 'yfinance' : '⚠️ 模拟数据'}
+                          </span>
+                        </span>
+                      )}
+                    </div>
+                    <Radio.Group
+                      value={klineRange}
+                      onChange={(e) => setKlineRange(e.target.value)}
+                      size="small"
+                      optionType="button"
+                      buttonStyle="solid"
+                      options={[
+                        { label: '1月', value: '1M' },
+                        { label: '3月', value: '3M' },
+                        { label: '6月', value: '6M' },
+                        { label: '1年', value: '1Y' },
+                      ]}
+                    />
+                  </div>
+
+                  {/* K 线图主体 */}
+                  {klineLoading ? (
+                    <div style={{ textAlign: 'center', padding: '60px 0' }}>
+                      <Spin size="large" />
+                      <div style={{ marginTop: 12, color: '#94a3b8', fontSize: 13 }}>
+                        加载 K 线数据中...
+                      </div>
+                    </div>
+                  ) : klineError ? (
+                    <Alert message={klineError} type="error" />
+                  ) : (
+                    <KLineChart data={klineData} height={400} />
+                  )}
+                </div>
+              ),
+            },
             {
               key: 'details',
               label: (

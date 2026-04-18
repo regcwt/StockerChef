@@ -103,6 +103,34 @@ export const getQuote = async (symbol: string): Promise<Quote> => {
   });
 };
 
+/**
+ * 直接并发获取单只美股报价（不走限流队列）
+ * 用于 Dashboard 批量刷新场景：多只股票同时发出请求，不串行等待
+ * Finnhub 免费层 60次/分钟，10只以内的自选股并发完全安全
+ */
+export const getQuoteDirect = async (symbol: string): Promise<Quote | null> => {
+  try {
+    const token = await requireApiKey();
+    const response = await axios.get(`${BASE_URL}/quote`, {
+      params: { symbol, token },
+    });
+    const data = response.data;
+    return {
+      symbol,
+      price: data.c || 0,
+      change: data.d || 0,
+      changePercent: data.dp || 0,
+      high: data.h,
+      low: data.l,
+      open: data.o,
+      previousClose: data.pc,
+      timestamp: new Date().toISOString(),
+    };
+  } catch {
+    return null;
+  }
+};
+
 export const getProfile = async (symbol: string): Promise<Partial<Stock>> => {
   return apiRequest(async () => {
     const token = await requireApiKey();
@@ -209,12 +237,28 @@ export const getHistoricalData = async (
       };
     }
 
-    // 成功：{ data: HistoricalDataPoint[], source: 'akshare' | 'yfinance' }
+    // 成功格式一：{ data: HistoricalDataPoint[], source: 'akshare' | 'yfinance' }
     if (parsed && typeof parsed === 'object' && 'data' in parsed && Array.isArray(parsed.data)) {
       return {
         data: parsed.data as HistoricalDataPoint[],
         source: parsed.source === 'akshare' ? 'akshare' : 'yfinance',
       };
+    }
+
+    // 成功格式二：数组格式 [{date, open, high, low, close, volume, source}, ...]
+    // yfinance_fetch.py 的旧版路由（美股/港股历史 K 线）直接返回数组
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      const firstItem = parsed[0];
+      const source = firstItem.source === 'akshare' ? 'akshare' : 'yfinance';
+      return {
+        data: parsed.map(({ source: _src, ...rest }: any) => rest) as HistoricalDataPoint[],
+        source,
+      };
+    }
+
+    // 空数组也是合法响应（如节假日无数据）
+    if (Array.isArray(parsed) && parsed.length === 0) {
+      return { data: [], source: 'simulated', error: 'No data returned for this date range' };
     }
 
     return { data: [], source: 'simulated', error: 'Unexpected response format from stock_fetch.py' };
@@ -235,6 +279,14 @@ export const getHistoricalData = async (
  */
 export const isCNStock = (symbol: string): boolean =>
   /^\d{6}$/.test(symbol);
+
+/**
+ * 判断是否为港股代码（4-6 位数字 + .HK 后缀，大小写不敏感）
+ * 例：03690.HK、00700.HK、3690.HK → true；AAPL、000001 → false
+ * 注意：港股标准格式为 5 位数字（含前导零），addToWatchlist 会自动补全
+ */
+export const isHKStock = (symbol: string): boolean =>
+  /^\d{4,6}\.HK$/i.test(symbol);
 
 /**
  * 获取单只 A 股实时行情（通过 AKShare stock_zh_a_spot）
