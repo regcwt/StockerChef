@@ -10,7 +10,17 @@ import {
   BellOutlined,
   BellFilled,
   DeleteOutlined,
+  MenuOutlined,
+  UpOutlined,
+  DownOutlined,
 } from '@ant-design/icons';
+import { DndContext, closestCenter, PointerSensor, useSensor, useSensors } from '@dnd-kit/core';
+import {
+  SortableContext,
+  useSortable,
+  verticalListSortingStrategy,
+} from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
 import { useStockStore, getChangeColors, COLUMN_DEFINITIONS } from '@/store/useStockStore';
 import type { AlertThreshold, ColumnKey } from '@/store/useStockStore';
 import { getQuoteDirect, searchSymbol, handleAPIError, isCNStock, isHKStock, searchCNSymbol } from '@/services/stockApi';
@@ -86,6 +96,39 @@ const getCellValue = (key: ColumnKey, symbol: string, quote: Quote | undefined):
 const isChangeColumn = (key: ColumnKey): boolean =>
   key === 'change' || key === 'changePercent';
 
+// 可排序的股票行组件
+const SortableItem = ({ symbol, onStockClick, children }: {
+  symbol: string;
+  onStockClick: (symbol: string) => void;
+  children: React.ReactNode;
+}) => {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: symbol,
+  });
+
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.5 : 1,
+  };
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      {...attributes}
+      {...listeners}
+    >
+      <div
+        onClick={() => onStockClick(symbol)}
+        className="stock-row"
+      >
+        {children}
+      </div>
+    </div>
+  );
+};
+
 const Dashboard = ({ onStockClick }: DashboardProps) => {
   const {
     watchlist, quotes, symbolNames, error, rateLimited,
@@ -93,10 +136,71 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
     alertThresholds, visibleColumns, indices, fetchIndices,
   } = useStockStore();
 
+  // 过滤状态：全部、A股、港股、美股
+  const [filter, setFilter] = useState<'all' | 'cn' | 'hk' | 'us'>('all');
+
+  // 传感器配置
+  const sensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: {
+        distance: 5,
+      },
+    })
+  );
+
+  // 处理拖动结束
+  const handleDragEnd = async (event: any) => {
+    const { active, over } = event;
+    
+    if (!over) return;
+    if (active.id === over.id) return;
+
+    const oldIndex = watchlist.indexOf(active.id as string);
+    const newIndex = watchlist.indexOf(over.id as string);
+
+    if (oldIndex === -1 || newIndex === -1) return;
+
+    // 创建新的顺序
+    const newWatchlist = [...watchlist];
+    newWatchlist.splice(oldIndex, 1);
+    newWatchlist.splice(newIndex, 0, active.id as string);
+
+    // 更新 watchlist 顺序
+    await useStockStore.getState().updateWatchlistOrder(newWatchlist);
+  };
+
+  // 上移股票
+  const handleMoveUp = async (symbol: string) => {
+    const index = watchlist.indexOf(symbol);
+    if (index > 0) {
+      const newWatchlist = [...watchlist];
+      [newWatchlist[index], newWatchlist[index - 1]] = [newWatchlist[index - 1], newWatchlist[index]];
+      await useStockStore.getState().updateWatchlistOrder(newWatchlist);
+    }
+  };
+
+  // 下移股票
+  const handleMoveDown = async (symbol: string) => {
+    const index = watchlist.indexOf(symbol);
+    if (index < watchlist.length - 1) {
+      const newWatchlist = [...watchlist];
+      [newWatchlist[index], newWatchlist[index + 1]] = [newWatchlist[index + 1], newWatchlist[index]];
+      await useStockStore.getState().updateWatchlistOrder(newWatchlist);
+    }
+  };
+
+  // 根据过滤条件过滤股票
+  const filteredWatchlist = watchlist.filter(symbol => {
+    if (filter === 'all') return true;
+    if (filter === 'cn') return isCNStock(symbol);
+    if (filter === 'hk') return isHKStock(symbol);
+    if (filter === 'us') return !isCNStock(symbol) && !isHKStock(symbol);
+    return true;
+  });
+
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [searching, setSearching] = useState(false);
-  const [refreshing, setRefreshing] = useState(false);
   // 是否正在从缓存恢复后的后台刷新（区别于用户手动刷新）
   const [backgroundRefreshing, setBackgroundRefreshing] = useState(false);
 
@@ -198,7 +302,6 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
 
   const fetchAllQuotes = async () => {
     if (watchlist.length === 0) return;
-    setRefreshing(true);
     setError(null);
     try {
       // 将 watchlist 按 A 股 / 港股 / 美股分组
@@ -328,7 +431,6 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
     } catch (err: any) {
       setError(handleAPIError(err));
     } finally {
-      setRefreshing(false);
       setBackgroundRefreshing(false);
     }
   };
@@ -780,6 +882,84 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
           onClose={() => setRateLimited(false)} style={{ marginBottom: 12, borderRadius: 12 }} />
       )}
 
+      {/* ── 过滤Tab ── */}
+      <div
+        style={{
+          marginBottom: 16,
+          display: 'flex',
+          gap: 8,
+          padding: '8px',
+          background: 'rgba(255,255,255,0.7)',
+          borderRadius: 12,
+          border: '1px solid rgba(79, 110, 247, 0.1)',
+        }}
+      >
+        <button
+          onClick={() => setFilter('all')}
+          style={{
+            padding: '6px 16px',
+            borderRadius: 8,
+            border: 'none',
+            background: filter === 'all' ? 'rgba(79, 110, 247, 0.1)' : 'transparent',
+            color: filter === 'all' ? '#4f6ef7' : '#6b7fa8',
+            fontWeight: filter === 'all' ? 600 : 400,
+            fontSize: 13,
+            cursor: 'pointer',
+            transition: 'all 0.2s',
+          }}
+        >
+          全部
+        </button>
+        <button
+          onClick={() => setFilter('cn')}
+          style={{
+            padding: '6px 16px',
+            borderRadius: 8,
+            border: 'none',
+            background: filter === 'cn' ? 'rgba(79, 110, 247, 0.1)' : 'transparent',
+            color: filter === 'cn' ? '#4f6ef7' : '#6b7fa8',
+            fontWeight: filter === 'cn' ? 600 : 400,
+            fontSize: 13,
+            cursor: 'pointer',
+            transition: 'all 0.2s',
+          }}
+        >
+          A股
+        </button>
+        <button
+          onClick={() => setFilter('hk')}
+          style={{
+            padding: '6px 16px',
+            borderRadius: 8,
+            border: 'none',
+            background: filter === 'hk' ? 'rgba(79, 110, 247, 0.1)' : 'transparent',
+            color: filter === 'hk' ? '#4f6ef7' : '#6b7fa8',
+            fontWeight: filter === 'hk' ? 600 : 400,
+            fontSize: 13,
+            cursor: 'pointer',
+            transition: 'all 0.2s',
+          }}
+        >
+          港股
+        </button>
+        <button
+          onClick={() => setFilter('us')}
+          style={{
+            padding: '6px 16px',
+            borderRadius: 8,
+            border: 'none',
+            background: filter === 'us' ? 'rgba(79, 110, 247, 0.1)' : 'transparent',
+            color: filter === 'us' ? '#4f6ef7' : '#6b7fa8',
+            fontWeight: filter === 'us' ? 600 : 400,
+            fontSize: 13,
+            cursor: 'pointer',
+            transition: 'all 0.2s',
+          }}
+        >
+          美股
+        </button>
+      </div>
+
       {/* ── 行式表格 ── */}
       {watchlist.length === 0 ? (
         <div
@@ -802,7 +982,8 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
           <div
             style={{
               display: 'grid',
-              gridTemplateColumns: buildGridTemplate(visibleColumnDefs.map((c) => c.key)),
+              gridTemplateColumns: `${buildGridTemplate(visibleColumnDefs.map((c) => c.key))} 100px auto`,
+              gridColumnGap: '4px',
               padding: '10px 16px',
               background: 'rgba(79, 110, 247, 0.04)',
               borderBottom: '1px solid rgba(79, 110, 247, 0.1)',
@@ -823,108 +1004,190 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
                 {col.label}
               </div>
             ))}
+            <div style={{ fontSize: 12, fontWeight: 600, color: '#8a9cc8', textTransform: 'uppercase', letterSpacing: '0.04em', textAlign: 'center' }}>排序</div>
             {/* 操作列 */}
             <div style={{ fontSize: 12, fontWeight: 600, color: '#8a9cc8', textAlign: 'right' }}>操作</div>
           </div>
 
           {/* 数据行 */}
-          {watchlist.map((symbol, rowIndex) => {
-            const quote = quotes[symbol];
-            // 关键调试：记录 03690.HK 的渲染数据
-            if (symbol === '03690.HK') {
-              console.log('[HK DEBUG RENDER] ===== 渲染 03690.HK =====');
-              console.log('[HK DEBUG RENDER] Symbol:', symbol);
-              console.log('[HK DEBUG RENDER] Quote:', quote);
-              console.log('[HK DEBUG RENDER] Quote keys:', quote ? Object.keys(quote) : 'undefined');
-              console.log('[HK DEBUG RENDER] Is placeholder?', quote ? (quote.price === 0 && quote.change === 0 && quote.changePercent === 0) : 'N/A');
-              console.log('[HK DEBUG RENDER] All store quotes keys:', Object.keys(quotes));
-            }
-            const isPositive = quote ? quote.change >= 0 : true;
-            const changeColor = isPositive ? upColor : downColor;
-            const isLastRow = rowIndex === watchlist.length - 1;
+          <DndContext
+            sensors={sensors}
+            collisionDetection={closestCenter}
+            onDragEnd={handleDragEnd}
+          >
+            <SortableContext
+              items={filteredWatchlist}
+              strategy={verticalListSortingStrategy}
+            >
+              {filteredWatchlist.map((symbol, rowIndex) => {
+                const quote = quotes[symbol];
+                // 关键调试：记录 03690.HK 的渲染数据
+                if (symbol === '03690.HK') {
+                  console.log('[HK DEBUG RENDER] ===== 渲染 03690.HK =====');
+                  console.log('[HK DEBUG RENDER] Symbol:', symbol);
+                  console.log('[HK DEBUG RENDER] Quote:', quote);
+                  console.log('[HK DEBUG RENDER] Quote keys:', quote ? Object.keys(quote) : 'undefined');
+                  console.log('[HK DEBUG RENDER] Is placeholder?', quote ? (quote.price === 0 && quote.change === 0 && quote.changePercent === 0) : 'N/A');
+                  console.log('[HK DEBUG RENDER] All store quotes keys:', Object.keys(quotes));
+                }
+                const isPositive = quote ? quote.change >= 0 : true;
+                const changeColor = isPositive ? upColor : downColor;
+                const isLastRow = rowIndex === filteredWatchlist.length - 1;
+                const isFirstRow = rowIndex === 0;
 
-            return (
-              <div
-                key={symbol}
-                onClick={() => onStockClick(symbol)}
-                style={{
-                  display: 'grid',
-                  gridTemplateColumns: buildGridTemplate(visibleColumnDefs.map((c) => c.key)),
-                  padding: '14px 16px',
-                  borderBottom: isLastRow ? 'none' : '1px solid rgba(79, 110, 247, 0.06)',
-                  cursor: 'pointer',
-                  transition: 'background 0.15s ease',
-                  alignItems: 'center',
-                }}
-                className="stock-row"
-              >
-                {visibleColumnDefs.map((col) => {
-                  const value = getCellValue(col.key, symbol, quote);
-                  const colored = isChangeColumn(col.key) && quote;
-                  const isSymbolCol = col.key === 'symbol';
-
-                  return (
+                return (
+                  <SortableItem
+                    key={symbol}
+                    symbol={symbol}
+                    onStockClick={onStockClick}
+                  >
                     <div
-                      key={col.key}
                       style={{
-                        fontSize: isSymbolCol ? 14 : 13,
-                        fontWeight: isSymbolCol ? 700 : 500,
-                        color: colored ? changeColor : isSymbolCol ? '#1a2e22' : '#3d5070',
-                        textAlign: isSymbolCol ? 'left' : 'right',
-                        letterSpacing: isSymbolCol ? '-0.01em' : undefined,
-                      }}
-                    >
-                      {quote === undefined && col.key !== 'symbol' ? (
-                        <Spin indicator={<LoadingOutlined style={{ fontSize: 12, color: '#4f6ef7' }} spin />} />
-                      ) : isSymbolCol ? (
-                        <div>
-                          <div>{value}</div>
-                          {symbolNames[symbol] && (
-                            <div style={{ fontSize: 11, fontWeight: 400, color: '#8a9cc8', marginTop: 1 }}>
-                              {symbolNames[symbol]}
-                            </div>
-                          )}
-                        </div>
-                      ) : (
-                        value
-                      )}
-                    </div>
-                  );
-                })}
-
-                {/* 操作列：铃铛 + 删除 */}
-                <div
-                  style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 6 }}
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  <Tooltip title="设置价格提醒">
-                    <div
-                      onClick={() => {
-                        const existing = alertThresholds[symbol];
-                        setAlertForm(existing || { symbol, changeAbove: 5, changeBelow: -5, enabled: true });
-                        setAlertModalSymbol(symbol);
-                      }}
-                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: `${buildGridTemplate(visibleColumnDefs.map((c) => c.key))} 100px auto`,
+                        gridColumnGap: '4px',
+                        padding: '14px 16px',
+                        borderBottom: isLastRow ? 'none' : '1px solid rgba(79, 110, 247, 0.06)',
                         cursor: 'pointer',
-                        color: alertThresholds[symbol]?.enabled ? '#4f6ef7' : '#c0cce0',
-                        fontSize: 14, padding: 4, borderRadius: 6,
-                        display: 'flex', alignItems: 'center',
-                        transition: 'color 0.2s',
+                        transition: 'background 0.15s ease',
+                        alignItems: 'center',
                       }}
                     >
-                      {alertThresholds[symbol]?.enabled ? <BellFilled /> : <BellOutlined />}
+                      {visibleColumnDefs.map((col) => {
+                        const value = getCellValue(col.key, symbol, quote);
+                        const colored = isChangeColumn(col.key) && quote;
+                        const isSymbolCol = col.key === 'symbol';
+
+                        return (
+                          <div
+                            key={col.key}
+                            style={{
+                              fontSize: isSymbolCol ? 14 : 13,
+                              fontWeight: isSymbolCol ? 700 : 500,
+                              color: colored ? changeColor : isSymbolCol ? '#1a2e22' : '#3d5070',
+                              textAlign: isSymbolCol ? 'left' : 'right',
+                              letterSpacing: isSymbolCol ? '-0.01em' : undefined,
+                            }}
+                          >
+                            {quote === undefined && col.key !== 'symbol' ? (
+                              <Spin indicator={<LoadingOutlined style={{ fontSize: 12, color: '#4f6ef7' }} spin />} />
+                            ) : isSymbolCol ? (
+                              <div>
+                                <div>{value}</div>
+                                {symbolNames[symbol] && (
+                                  <div style={{ fontSize: 11, fontWeight: 400, color: '#8a9cc8', marginTop: 1 }}>
+                                    {symbolNames[symbol]}
+                                  </div>
+                                )}
+                              </div>
+                            ) : (
+                              value
+                            )}
+                          </div>
+                        );
+                      })}
+                      
+                      {/* 排序操作区 */}
+                      <div
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'space-between',
+                          gap: 4,
+                          padding: '2px',
+                        }}
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        {/* 拖动手柄 */}
+                        <Tooltip title="拖动排序">
+                          <div
+                            style={{
+                              cursor: 'grab',
+                              color: '#c0cce0',
+                              fontSize: 12,
+                              padding: 3,
+                              borderRadius: 4,
+                              transition: 'color 0.2s',
+                            }}
+                          >
+                            <MenuOutlined />
+                          </div>
+                        </Tooltip>
+                        {/* 上移下移按钮 */}
+                        <div style={{ display: 'flex', gap: 2 }}>
+                          {/* 上移按钮 */}
+                          <Tooltip title="上移">
+                            <div
+                              onClick={() => handleMoveUp(symbol)}
+                              style={{
+                                cursor: 'pointer',
+                                color: !isFirstRow ? '#c0cce0' : '#e0e0e0',
+                                fontSize: 12,
+                                padding: 3,
+                                borderRadius: 4,
+                                transition: 'color 0.2s',
+                                opacity: !isFirstRow ? 1 : 0.5,
+                              }}
+                            >
+                              <UpOutlined />
+                            </div>
+                          </Tooltip>
+                          {/* 下移按钮 */}
+                          <Tooltip title="下移">
+                            <div
+                              onClick={() => handleMoveDown(symbol)}
+                              style={{
+                                cursor: 'pointer',
+                                color: !isLastRow ? '#c0cce0' : '#e0e0e0',
+                                fontSize: 12,
+                                padding: 3,
+                                borderRadius: 4,
+                                transition: 'color 0.2s',
+                                opacity: !isLastRow ? 1 : 0.5,
+                              }}
+                            >
+                              <DownOutlined />
+                            </div>
+                          </Tooltip>
+                        </div>
+                      </div>
+
+                      {/* 操作列：铃铛 + 删除 */}
+                      <div
+                        style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 6 }}
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <Tooltip title="设置价格提醒">
+                          <div
+                            onClick={() => {
+                              const existing = alertThresholds[symbol];
+                              setAlertForm(existing || { symbol, changeAbove: 5, changeBelow: -5, enabled: true });
+                              setAlertModalSymbol(symbol);
+                            }}
+                            style={{
+                              cursor: 'pointer',
+                              color: alertThresholds[symbol]?.enabled ? '#4f6ef7' : '#c0cce0',
+                              fontSize: 14, padding: 4, borderRadius: 6,
+                              display: 'flex', alignItems: 'center',
+                              transition: 'color 0.2s',
+                            }}
+                          >
+                            {alertThresholds[symbol]?.enabled ? <BellFilled /> : <BellOutlined />}
+                          </div>
+                        </Tooltip>
+                        <Tooltip title="删除">
+                          <DeleteOutlined
+                            onClick={() => handleRemoveStock(symbol)}
+                            style={{ cursor: 'pointer', color: '#c0cce0', fontSize: 14, padding: 4, borderRadius: 6, transition: 'color 0.2s' }}
+                          />
+                        </Tooltip>
+                      </div>
                     </div>
-                  </Tooltip>
-                  <Tooltip title="删除">
-                    <DeleteOutlined
-                      onClick={() => handleRemoveStock(symbol)}
-                      style={{ cursor: 'pointer', color: '#c0cce0', fontSize: 14, padding: 4, borderRadius: 6, transition: 'color 0.2s' }}
-                    />
-                  </Tooltip>
-                </div>
-              </div>
-            );
-          })}
+                  </SortableItem>
+                );
+              })}
+            </SortableContext>
+          </DndContext>
         </div>
       )}
 

@@ -99,6 +99,8 @@ interface StockState {
   // Actions
   addToWatchlist: (symbol: string) => Promise<void>;
   removeFromWatchlist: (symbol: string) => Promise<void>;
+  /** 更新 watchlist 顺序 */
+  updateWatchlistOrder: (newOrder: string[]) => Promise<void>;
   /** 保存 symbol 对应的公司名称（从搜索结果的 description 字段获取） */
   setSymbolName: (symbol: string, name: string) => Promise<void>;
   loadSymbolNames: () => Promise<void>;
@@ -203,6 +205,13 @@ export const useStockStore = create<StockState>((set, get) => ({
     const newQuotes = { ...get().quotes };
     delete newQuotes[symbol];
     set({ quotes: newQuotes });
+    
+    // Save to electron-store
+    await get().saveWatchlist();
+  },
+  
+  updateWatchlistOrder: async (newOrder: string[]) => {
+    set({ watchlist: newOrder });
     
     // Save to electron-store
     await get().saveWatchlist();
