@@ -1,0 +1,8 @@
+node_modules
+dist
+dist-electron
+.env
+.DS_Store
+*.log
+npm-debug.log*
+resources/icon.png.backup
