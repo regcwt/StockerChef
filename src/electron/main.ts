@@ -3,6 +3,10 @@ import { join, resolve } from 'path';
 import { execFile } from 'child_process';
 import Store from 'electron-store';
 
+// Disable hardware acceleration to prevent GPU process crashes on macOS
+// This is safe for stock dashboard apps that don't need 3D rendering
+app.disableHardwareAcceleration();
+
 const store = new Store();
 
 let mainWindow: BrowserWindow | null = null;
@@ -66,6 +70,10 @@ function createWindow() {
     mainWindow = null;
   });
 }
+
+// 禁用 GPU 硬件加速，避免 GPU process crash 和网络服务崩溃
+// macOS 上 Electron 28+ 的常见问题，禁用后对股票看板应用无影响
+app.disableHardwareAcceleration();
 
 app.whenReady().then(() => {
   // 开发模式下手动设置 Dock 图标（打包后由 electron-builder 自动处理）
@@ -253,12 +261,16 @@ ipcMain.handle('stock-get-hk-quote', (_event, symbols: string): Promise<string> 
 });
 
 // IPC handler for 关键指数行情
-// 数据源：A 股指数（上证、科创综指）→ AKShare stock_zh_index_spot_sina
+// 数据源：A 股指数（上证、科创综指）→ AKShare stock_zh_index_daily
 //         港股指数（恒生、恒生科技）→ AKShare stock_hk_index_spot_sina
 //         美股指数（纳斯达克、标普）→ AKShare index_us_stock_sina（最近两日对比计算涨跌）
 ipcMain.handle('stock-get-indices', (): Promise<string> => {
   return new Promise((resolve) => {
-    runPythonScript(['--action', 'get_indices'], 30000, resolve);
+    console.log('[INDICES DEBUG] main.ts: Executing Python script for get_indices');
+    runPythonScript(['--action', 'get_indices'], 60000, (result) => {
+      console.log('[INDICES DEBUG] main.ts: Python script result:', result);
+      resolve(result);
+    });
   });
 });
 

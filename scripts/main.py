@@ -247,17 +247,17 @@ def handle_us_quote(symbols: list[str], us_providers: list[str]) -> list[dict]:
 def handle_get_indices() -> list[dict]:
     """
     获取关键指数行情：
-      - A 股指数（上证、科创综指）→ AKShare stock_zh_index_spot_sina
+      - A 股指数（上证、科创综指）→ AKShare stock_zh_index_daily
       - 港股指数（恒生、恒生科技）→ AKShare stock_hk_index_spot_sina
       - 美股指数（纳斯达克、标普）→ AKShare index_us_stock_sina（取最近两日对比）
-    列名说明：stock_zh_index_spot_sina / stock_hk_index_spot_sina 返回：
-      代码、名称、最新价、涨跌额、涨跌幅、昨收、今开、最高、最低
-
+    
     注意：AKShare 内部使用 tqdm 进度条，默认输出到 stdout，会污染 JSON 输出。
     通过临时将 sys.stdout 重定向到 sys.stderr，确保 stdout 只有纯 JSON。
     """
     import akshare as ak
     import sys
+
+    print("[INDICES DEBUG] Starting handle_get_indices()", file=sys.stderr)
 
     # 将 stdout 临时重定向到 stderr，防止 AKShare 内部的 tqdm 进度条污染 JSON 输出
     # 必须用 try/finally 确保 stdout 一定被恢复，否则后续的 print(json.dumps(...)) 也会丢失
@@ -269,91 +269,124 @@ def handle_get_indices() -> list[dict]:
     def _parse_row(r: dict, symbol: str, name: str) -> dict | None:
         """从新浪指数行情行解析为统一格式，直接使用涨跌额/涨跌幅字段"""
         try:
+            print(f"[INDICES DEBUG] _parse_row input: {r}", file=sys.stderr)
             price = float(r.get("最新价", 0) or 0)
             change = float(r.get("涨跌额", 0) or 0)
             change_pct = float(r.get("涨跌幅", 0) or 0)
-            return {
+            result = {
                 "symbol": symbol,
                 "name": name,
                 "price": round(price, 2),
                 "change": round(change, 2),
                 "changePercent": round(change_pct, 2),
             }
-        except Exception:
+            print(f"[INDICES DEBUG] _parse_row output: {result}", file=sys.stderr)
+            return result
+        except Exception as e:
+            print(f"[INDICES DEBUG] _parse_row failed: {e}", file=sys.stderr)
             return None
 
     try:
         # ── A 股指数（上证、科创综指）────────────────────────────────────────
-        # stock_zh_index_spot_sina 在部分网络环境下返回 HTML 错误页，
-        # 改用 stock_zh_index_daily 取最近两日日线数据计算涨跌（更稳定）
+        # stock_zh_index_daily 取最近两日日线数据计算涨跌（更稳定）
+        print("[INDICES DEBUG] Fetching A-share indices...", file=sys.stderr)
         cn_index_map = {
             "sh000001": ("上证指数", "000001.SH"),
             "sh000688": ("科创综指", "000688.SH"),
         }
         for sina_code, (name, symbol) in cn_index_map.items():
             try:
+                print(f"[INDICES DEBUG] Fetching {sina_code} ({name})...", file=sys.stderr)
                 df_cn = ak.stock_zh_index_daily(symbol=sina_code)
+                print(f"[INDICES DEBUG] {sina_code} DataFrame shape: {df_cn.shape if df_cn is not None else 'None'}", file=sys.stderr)
+                if df_cn is not None:
+                    print(f"[INDICES DEBUG] {sina_code} columns: {df_cn.columns.tolist()}", file=sys.stderr)
+                    print(f"[INDICES DEBUG] {sina_code} last 2 rows:\n{df_cn.tail(2)}", file=sys.stderr)
                 if df_cn is None or len(df_cn) < 2:
+                    print(f"[INDICES DEBUG] {sina_code} skipped: insufficient data", file=sys.stderr)
                     continue
                 df_cn = df_cn.sort_values("date").tail(2).reset_index(drop=True)
                 price = float(df_cn.iloc[-1]["close"])
                 prev_close = float(df_cn.iloc[-2]["close"])
                 change = price - prev_close
                 change_pct = (change / prev_close * 100) if prev_close else 0
-                results.append({
+                result = {
                     "symbol": symbol,
                     "name": name,
                     "price": round(price, 2),
                     "change": round(change, 2),
                     "changePercent": round(change_pct, 2),
-                })
-            except Exception:
-                pass
+                }
+                print(f"[INDICES DEBUG] {sina_code} result: {result}", file=sys.stderr)
+                results.append(result)
+            except Exception as e:
+                print(f"[INDICES DEBUG] {sina_code} failed: {e}", file=sys.stderr)
 
         # ── 港股指数（恒生指数、恒生科技）───────────────────────────────────
+        print("[INDICES DEBUG] Fetching HK indices...", file=sys.stderr)
         try:
             df_hk = ak.stock_hk_index_spot_sina()
+            print(f"[INDICES DEBUG] HK index DataFrame shape: {df_hk.shape if df_hk is not None else 'None'}", file=sys.stderr)
+            if df_hk is not None:
+                print(f"[INDICES DEBUG] HK index columns: {df_hk.columns.tolist()}", file=sys.stderr)
             hk_index_map = {
                 "HSI":    "恒生指数",
                 "HSTECH": "恒生科技",
             }
             for code, name in hk_index_map.items():
-                row = df_hk[df_hk["代码"] == code]
-                if not row.empty:
-                    item = _parse_row(row.iloc[0].to_dict(), code, name)
-                    if item:
-                        results.append(item)
-        except Exception:
-            pass
+                try:
+                    row = df_hk[df_hk["代码"] == code]
+                    print(f"[INDICES DEBUG] HK {code} found rows: {len(row)}", file=sys.stderr)
+                    if not row.empty:
+                        item = _parse_row(row.iloc[0].to_dict(), code, name)
+                        if item:
+                            results.append(item)
+                    else:
+                        print(f"[INDICES DEBUG] HK {code} not found in DataFrame", file=sys.stderr)
+                except Exception as e:
+                    print(f"[INDICES DEBUG] HK {code} parsing failed: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"[INDICES DEBUG] HK indices fetch failed: {e}", file=sys.stderr)
 
         # ── 美股指数（纳斯达克、标普500）────────────────────────────────────
         # index_us_stock_sina 返回历史日线，取最近两日计算涨跌
+        print("[INDICES DEBUG] Fetching US indices...", file=sys.stderr)
         us_index_map = {
             ".IXIC": "纳斯达克",
             ".INX":  "标普500",
         }
         for sina_code, name in us_index_map.items():
             try:
+                print(f"[INDICES DEBUG] Fetching {sina_code} ({name})...", file=sys.stderr)
                 df_us = ak.index_us_stock_sina(symbol=sina_code)
+                print(f"[INDICES DEBUG] {sina_code} DataFrame shape: {df_us.shape if df_us is not None else 'None'}", file=sys.stderr)
+                if df_us is not None:
+                    print(f"[INDICES DEBUG] {sina_code} columns: {df_us.columns.tolist()}", file=sys.stderr)
                 if df_us is None or len(df_us) < 2:
+                    print(f"[INDICES DEBUG] {sina_code} skipped: insufficient data", file=sys.stderr)
                     continue
                 df_us = df_us.sort_values("date").tail(2).reset_index(drop=True)
                 price = float(df_us.iloc[-1]["close"])
                 prev_close = float(df_us.iloc[-2]["close"])
                 change = price - prev_close
                 change_pct = (change / prev_close * 100) if prev_close else 0
-                results.append({
+                result = {
                     "symbol": sina_code,
                     "name": name,
                     "price": round(price, 2),
                     "change": round(change, 2),
                     "changePercent": round(change_pct, 2),
-                })
-            except Exception:
-                pass
+                }
+                print(f"[INDICES DEBUG] {sina_code} result: {result}", file=sys.stderr)
+                results.append(result)
+            except Exception as e:
+                print(f"[INDICES DEBUG] {sina_code} failed: {e}", file=sys.stderr)
     finally:
         # 无论是否发生异常，都必须恢复 stdout
         sys.stdout = _real_stdout
+
+    print(f"[INDICES DEBUG] Final results count: {len(results)}", file=sys.stderr)
+    print(f"[INDICES DEBUG] Final results: {results}", file=sys.stderr)
 
     return results
 

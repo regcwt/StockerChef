@@ -443,17 +443,28 @@ export const useStockStore = create<StockState>((set, get) => ({
 
   fetchIndices: async () => {
     try {
+      console.log('[INDICES DEBUG] fetchIndices: Calling window.electronAPI.getIndices()');
       const rawJson = await window.electronAPI.getIndices();
+      console.log('[INDICES DEBUG] fetchIndices: Raw JSON response:', rawJson);
+      
       // 从 rawJson 中提取最后一个完整 JSON 数组（防止 AKShare tqdm 进度条污染 stdout）
       const jsonMatch = rawJson.match(/(\[[\s\S]*\])\s*$/);
       const cleanJson = jsonMatch ? jsonMatch[1] : rawJson;
+      console.log('[INDICES DEBUG] fetchIndices: Clean JSON:', cleanJson);
+      
       const parsed = JSON.parse(cleanJson);
+      console.log('[INDICES DEBUG] fetchIndices: Parsed result:', parsed);
+      console.log('[INDICES DEBUG] fetchIndices: Is array?', Array.isArray(parsed));
+      
       if (Array.isArray(parsed)) {
+        console.log('[INDICES DEBUG] fetchIndices: Updating indices with', parsed.length, 'items');
         set({ indices: parsed as IndexQuote[] });
+      } else {
+        console.warn('[INDICES DEBUG] fetchIndices: Parsed result is not an array!', typeof parsed);
       }
     } catch (error) {
       // 静默失败：保留上次数据，不影响主流程
-      console.error('Failed to fetch indices:', error);
+      console.error('[INDICES DEBUG] fetchIndices: Failed with error:', error);
     }
   },
 }));

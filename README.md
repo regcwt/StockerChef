@@ -5,6 +5,8 @@ A macOS desktop stock dashboard application built with Electron + React + Vite +
 ![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
+**[📖 中文文档](README-zh.md)** | **[English Documentation](README.md)**
+
 ## Features
 
 - 📊 **Real-time Stock Quotes** - Monitor your favorite stocks with auto-refreshing prices
@@ -25,12 +27,18 @@ A macOS desktop stock dashboard application built with Electron + React + Vite +
 - **HTTP Client**: Axios
 - **Routing**: React Router v6
 - **Local Storage**: electron-store
-- **Stock API**: Finnhub (free tier)
+- **Stock Data Sources**:
+  - **A-shares & HK stocks**: AKShare (Python)
+  - **US stocks**: Finnhub API + yfinance (Python)
+  - **US indices**: AKShare (Python)
+- **Python Dependencies**: akshare, tushare (optional), yfinance
 
 ## Prerequisites
 
 - Node.js 18.x or higher
 - npm or yarn
+- Python 3.8 or higher (required for stock data fetching)
+- macOS (for `.dmg` packaging)
 
 ## Getting Started
 
@@ -43,9 +51,28 @@ cd StockerChef
 
 ### 2. Install Dependencies
 
+**Install Node.js dependencies:**
+
 ```bash
 npm install
 ```
+
+**Install Python dependencies (required for stock data):**
+
+```bash
+# macOS: Install Python packages system-wide
+python3 -m pip install --break-system-packages -r requirements.txt
+
+# Or use a virtual environment (recommended):
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+```
+
+**Required Python packages:**
+- `akshare` - Chinese A-shares, Hong Kong stocks, and US indices data
+- `tushare` - A-share data (optional, requires API token)
+- `yfinance` - US stock historical data
 
 ### 3. Get Finnhub API Key
 
@@ -168,8 +195,19 @@ Your watchlist is automatically saved to local storage using `electron-store`. T
 
 ## Troubleshooting
 
+### "No module named 'akshare'" or Python script errors
+- Install Python dependencies: `python3 -m pip install --break-system-packages -r requirements.txt`
+- Verify installation: `python3 scripts/main.py --action get_indices`
+- Check Python version: `python3 --version` (should be 3.8+)
+
+### GPU process crashed / Network service crashed (macOS)
+- Already fixed: Hardware acceleration is disabled in the code
+- If you still see these errors, restart the application
+- These errors are harmless and don't affect functionality
+
 ### "Invalid API key" error
-- Make sure you've created a `.env` file with your Finnhub API key
+- Go to **Settings → Data Sources** and enter your Finnhub API key
+- The key is saved locally and takes effect immediately — no restart required
 - Verify the key is correct by testing it on Finnhub's website
 
 ### "Rate limit exceeded" error
@@ -179,13 +217,16 @@ Your watchlist is automatically saved to local storage using `electron-store`. T
 
 ### App won't start
 - Make sure all dependencies are installed: `npm install`
-- Check that Node.js version is 18.x or higher
+- Make sure Python dependencies are installed: `python3 -m pip install --break-system-packages -r requirements.txt`
+- Check that Node.js version is 18.x or higher: `node --version`
 - Clear the cache: `rm -rf node_modules dist dist-electron && npm install`
 
 ### Stock data not loading
 - Check your internet connection
-- Verify your API key is valid
+- Verify your API key is valid (Settings → Data Sources)
+- Check Python packages are installed correctly
 - Check the browser console for error messages (DevTools opens automatically in dev mode)
+- For A-shares/HK stocks: AKShare may be temporarily unavailable, the app will retry automatically
 
 ## Building for Production
 
@@ -232,12 +273,12 @@ const MAX_REQUESTS_PER_MINUTE = 30; // Change this value
 ## Future Enhancements
 
 - [ ] WebSocket support for real-time updates
-- [ ] Historical price charts
 - [ ] Portfolio tracking
-- [ ] Price alerts
+- [ ] Price alerts with system notifications
 - [ ] Multiple watchlists
 - [ ] Export data to CSV
-- [ ] A股 (Chinese stock market) support
+- [ ] Real-time technical indicators (currently calculated on-demand)
+- [ ] More data source providers
 
 ## License
 
@@ -245,9 +286,12 @@ MIT License - feel free to use this project for personal or commercial purposes.
 
 ## Acknowledgments
 
-- [Finnhub](https://finnhub.io/) for providing free stock market data API
+- [AKShare](https://github.com/akfamily/akshare) for Chinese and Hong Kong stock data
+- [yfinance](https://github.com/ranaroussi/yfinance) for US stock historical data
+- [Finnhub](https://finnhub.io/) for real-time US stock quotes and news API
 - [Ant Design](https://ant.design/) for the beautiful UI components
 - [Electron](https://www.electronjs.org/) for the desktop framework
+- [lightweight-charts](https://www.tradingview.com/lightweight-charts/) for K-line chart rendering
 
 ---
 

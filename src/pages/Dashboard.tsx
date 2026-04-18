@@ -131,6 +131,7 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
       // 指数数据不依赖 watchlist，在 init 完成后立即触发首次加载
       // 原因：useEffect 的 initialized 守卫会在下一个 render 周期才执行，
       // 而 initDashboard 里直接调用可以确保首次加载立即发起
+      console.log('[INDICES DEBUG] Dashboard: Calling fetchIndices from initDashboard');
       useStockStore.getState().fetchIndices();
     };
     initDashboard();
@@ -215,9 +216,13 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
       const hkQuotePromise: Promise<Quote[]> = hkSymbols.length > 0
         ? Promise.race([
             (async () => {
+              console.log('[HK DEBUG] Fetching HK quotes for symbols:', hkSymbols);
               try {
                 const rawJson = await window.electronAPI.getHKQuote(hkSymbols.join(','));
+                console.log('[HK DEBUG] Raw JSON response:', rawJson);
                 const parsed = JSON.parse(rawJson);
+                console.log('[HK DEBUG] Parsed result:', parsed);
+                console.log('[HK DEBUG] Is array?', Array.isArray(parsed));
                 if (Array.isArray(parsed)) {
                   // 顺便保存公司名称（港股行情数据里有 name 字段，stock_hk_spot 返回中文名）
                   parsed.forEach((item: any) => {
@@ -238,7 +243,8 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
                     timestamp: new Date().toISOString(),
                   }));
                 }
-              } catch {
+              } catch (err) {
+                console.error('[HK DEBUG] Error fetching HK quotes:', err);
                 // AKShare 不可用时静默跳过
               }
               return [] as Quote[];
@@ -310,6 +316,7 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
   // 原因：指数是预设固定列表，与自选股无关，不应因 watchlist 变化而重复触发
   useEffect(() => {
     if (!initialized) return;
+    console.log('[INDICES DEBUG] Dashboard: Calling fetchIndices from interval useEffect');
     fetchIndices();
     const interval = setInterval(fetchIndices, refreshInterval * 1000);
     return () => clearInterval(interval);

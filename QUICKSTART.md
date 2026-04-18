@@ -51,6 +51,25 @@ The `npm install` command is currently running. This may take a few minutes as i
 
 **Current status:** Installing dependencies...
 
+### 1.5. Install Python Dependencies (Required)
+
+The application uses Python scripts for A-share, Hong Kong, and US stock data. Install required Python packages:
+
+```bash
+# macOS: Install Python packages system-wide
+python3 -m pip install --break-system-packages -r requirements.txt
+
+# Or if you prefer virtual environments:
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+```
+
+**Required packages:**
+- `akshare` - Chinese & Hong Kong stock data
+- `tushare` - A-share data (optional, requires token)
+- `yfinance` - US stock historical data
+
 ### 2. Get Your Finnhub API Key
 
 1. Visit: https://finnhub.io/register
@@ -137,6 +156,19 @@ npm install
 # Check Node.js version (should be 18+)
 node --version
 ```
+
+If you get Python script errors (e.g., "No module named 'akshare'"):
+```bash
+# Install Python dependencies
+python3 -m pip install --break-system-packages -r requirements.txt
+
+# Verify installation
+python3 scripts/main.py --action get_indices
+```
+
+If you get GPU process crashes or network service errors (macOS):
+- Already fixed in code: `app.disableHardwareAcceleration()` is enabled
+- Restart the app to apply the fix
 
 If you get "Invalid API key" errors:
 - Make sure `.env` file has your correct Finnhub API key
