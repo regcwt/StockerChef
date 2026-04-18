@@ -100,6 +100,35 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
   // 是否正在从缓存恢复后的后台刷新（区别于用户手动刷新）
   const [backgroundRefreshing, setBackgroundRefreshing] = useState(false);
 
+  // 预置股票数据缓存（用于本地快速搜索）
+  const [presetStocks, setPresetStocks] = useState<{
+    cn: Array<{symbol: string; name: string; pinyinInitials: string; market: string}>;
+    hk: Array<{symbol: string; name: string; pinyinInitials: string; market: string}>;
+    us: Array<{symbol: string; name: string; market: string}>;
+  }>({ cn: [], hk: [], us: [] });
+
+  // 组件挂载时加载预置股票数据
+  useEffect(() => {
+    const loadPresetData = async () => {
+      try {
+        const [cnData, hkData, usData] = await Promise.all([
+          window.electronAPI.getPresetStockData('cn'),
+          window.electronAPI.getPresetStockData('hk'),
+          window.electronAPI.getPresetStockData('us'),
+        ]);
+        
+        setPresetStocks({
+          cn: JSON.parse(cnData),
+          hk: JSON.parse(hkData),
+          us: JSON.parse(usData),
+        });
+      } catch (err) {
+        console.error('[Preset Stocks] 加载失败:', err);
+      }
+    };
+    loadPresetData();
+  }, []);
+
   // 阈值提醒弹窗状态
   const [alertModalSymbol, setAlertModalSymbol] = useState<string | null>(null);
   const [alertForm, setAlertForm] = useState<Partial<AlertThreshold>>({});
@@ -211,8 +240,8 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
         : Promise.resolve([]);
 
       // 港股：通过 AKShare 获取（一次调用，支持 XXXXX.HK 格式）
-      // 加 35 秒超时兜底：stock_hk_spot 失败时会降级到 stock_hk_daily（实测约 7 秒），
-      // 加上 stock_hk_spot 锁等待（最多 3 秒），总耗时约 10 秒，35 秒足够
+      // 加 90 秒超时兜底：AKShare 港股首次调用需要缓存全量数据（约 2745 只），耗时约 55 秒
+      // 后续调用会使用缓存，速度会快很多
       const hkQuotePromise: Promise<Quote[]> = hkSymbols.length > 0
         ? Promise.race([
             (async () => {
@@ -249,7 +278,7 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
               }
               return [] as Quote[];
             })(),
-            new Promise<Quote[]>((resolve) => setTimeout(() => resolve([]), 35000)),
+            new Promise<Quote[]>((resolve) => setTimeout(() => resolve([]), 90000)),
           ])
         : Promise.resolve([]);
 
@@ -269,6 +298,8 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
 
       const [cnQuotes, hkQuotes, ...usResults] = await Promise.all([cnQuotePromise, hkQuotePromise, ...usQuotePromises]);
       const validQuotes = [...cnQuotes, ...hkQuotes, ...usResults.filter((q): q is Quote => q !== null)];
+      console.log('[HK DEBUG] Valid quotes to update:', validQuotes);
+      console.log('[HK DEBUG] HK quotes array:', hkQuotes);
       useStockStore.getState().updateQuotes(validQuotes);
       validQuotes.forEach((quote) => checkAlertThreshold(quote.symbol, quote));
 
@@ -340,45 +371,44 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
         const normalizedSymbol = hkMatch
           ? hkMatch[1].padStart(5, '0') + '.HK'
           : trimmed;
+        
+        // 尝试从预置数据中获取名称
+        const hkStock = presetStocks.hk.find(s => s.symbol === normalizedSymbol);
         setSearchResults([{
           symbol: normalizedSymbol,
           displaySymbol: normalizedSymbol,
-          description: '港股',
+          description: hkStock?.name || '港股',
           type: 'HK',
         }]);
         return;
       }
 
-      // A 股搜索：纯数字 或 包含中文字符 → AKShare 本地全量数据模糊匹配（快）
+      // A 股搜索：纯数字 或 包含中文字符 → 优先使用预置数据（快）
       const isCNQuery = /^\d+$/.test(query) || /[\u4e00-\u9fa5]/.test(query);
       if (isCNQuery) {
+        // 先搜索预置数据
+        const presetResults = searchPresetStocks(query);
+        if (presetResults.length > 0) {
+          setSearchResults(presetResults);
+          setSearching(false);
+          return;
+        }
+        // 预置数据未找到，降级为 AKShare 搜索
         const results = await searchCNSymbol(query);
         setSearchResults(results.slice(0, 5));
         return;
       }
 
-      // 美股：纯字母（1-5位）时本地即时识别，同时尝试 Finnhub 搜索补充描述
-      // 本地结果立即展示，Finnhub 结果（有 Key 时）异步补充
-      if (/^[A-Z]{1,5}$/.test(trimmed)) {
-        // 先立即展示本地识别结果，用户无需等待
-        setSearchResults([{
-          symbol: trimmed,
-          displaySymbol: trimmed,
-          description: '美股',
-          type: 'Common Stock',
-        }]);
-        // 异步尝试 Finnhub 搜索补充更多结果（有 Key 时才有效）
-        searchSymbol(query).then((finnhubResults) => {
-          if (finnhubResults.length > 0) {
-            setSearchResults(finnhubResults.slice(0, 5));
-          }
-        }).catch(() => {
-          // Finnhub 不可用时静默跳过，本地识别结果已展示
-        });
+      // 美股搜索：优先使用预置数据
+      // 先搜索预置数据
+      const presetResults = searchPresetStocks(query);
+      if (presetResults.length > 0) {
+        setSearchResults(presetResults);
+        setSearching(false);
         return;
       }
-
-      // 其他格式（如 BRK.B 等含点号的美股）→ 直接走 Finnhub 搜索
+      
+      // 预置数据未找到，降级为 Finnhub 搜索
       const results = await searchSymbol(query);
       setSearchResults(results.slice(0, 5));
     } catch (err: any) {
@@ -389,6 +419,73 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
     } finally {
       setSearching(false);
     }
+  };
+
+  /** 搜索预置股票数据（本地快速搜索） */
+  const searchPresetStocks = (query: string): SearchResult[] => {
+    const trimmed = query.trim().toLowerCase();
+    if (!trimmed) return [];
+
+    const results: SearchResult[] = [];
+    const seen = new Set<string>(); // 去重
+
+    // 搜索 A股
+    for (const stock of presetStocks.cn) {
+      const matchSymbol = stock.symbol.startsWith(trimmed);
+      const matchName = stock.name.toLowerCase().includes(trimmed);
+      const matchPinyin = stock.pinyinInitials?.toLowerCase().includes(trimmed) || false;
+      
+      if (matchSymbol || matchName || matchPinyin) {
+        if (!seen.has(stock.symbol)) {
+          seen.add(stock.symbol);
+          results.push({
+            symbol: stock.symbol,
+            displaySymbol: stock.symbol,
+            description: stock.name,
+            type: 'A股',
+          });
+        }
+      }
+      if (results.length >= 10) break; // 限制数量
+    }
+
+    // 搜索港股
+    for (const stock of presetStocks.hk) {
+      const matchSymbol = stock.symbol.toLowerCase().startsWith(trimmed);
+      const matchName = stock.name.toLowerCase().includes(trimmed);
+      const matchPinyin = stock.pinyinInitials?.toLowerCase().includes(trimmed) || false;
+      
+      if (matchSymbol || matchName || matchPinyin) {
+        if (!seen.has(stock.symbol)) {
+          seen.add(stock.symbol);
+          results.push({
+            symbol: stock.symbol,
+            displaySymbol: stock.symbol,
+            description: stock.name,
+            type: '港股',
+          });
+        }
+      }
+      if (results.length >= 10) break;
+    }
+
+    // 搜索美股
+    for (const stock of presetStocks.us) {
+      if (stock.symbol.toLowerCase().startsWith(trimmed) || stock.name.toLowerCase().includes(trimmed)) {
+        if (!seen.has(stock.symbol)) {
+          seen.add(stock.symbol);
+          results.push({
+            symbol: stock.symbol,
+            displaySymbol: stock.symbol,
+            description: stock.name,
+            type: '美股',
+          });
+        }
+      }
+      if (results.length >= 10) break;
+    }
+
+    return results.slice(0, 5); // 最多返回 5 条
   };
 
   /**
@@ -527,9 +624,8 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
                   {losers} 跌
                 </Tag>
                 <Button
-                  icon={<ReloadOutlined spin={refreshing} />}
+                  icon={<ReloadOutlined />}
                   onClick={() => fetchAllQuotes()}
-                  loading={refreshing}
                   style={{ borderRadius: 20, fontWeight: 500 }}
                 >
                   刷新
@@ -734,6 +830,15 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
           {/* 数据行 */}
           {watchlist.map((symbol, rowIndex) => {
             const quote = quotes[symbol];
+            // 关键调试：记录 03690.HK 的渲染数据
+            if (symbol === '03690.HK') {
+              console.log('[HK DEBUG RENDER] ===== 渲染 03690.HK =====');
+              console.log('[HK DEBUG RENDER] Symbol:', symbol);
+              console.log('[HK DEBUG RENDER] Quote:', quote);
+              console.log('[HK DEBUG RENDER] Quote keys:', quote ? Object.keys(quote) : 'undefined');
+              console.log('[HK DEBUG RENDER] Is placeholder?', quote ? (quote.price === 0 && quote.change === 0 && quote.changePercent === 0) : 'N/A');
+              console.log('[HK DEBUG RENDER] All store quotes keys:', Object.keys(quotes));
+            }
             const isPositive = quote ? quote.change >= 0 : true;
             const changeColor = isPositive ? upColor : downColor;
             const isLastRow = rowIndex === watchlist.length - 1;

@@ -2,6 +2,7 @@ import { app, BrowserWindow, ipcMain, Notification } from 'electron';
 import { join, resolve } from 'path';
 import { execFile } from 'child_process';
 import Store from 'electron-store';
+import { readFileSync, existsSync } from 'fs';
 
 // Disable hardware acceleration to prevent GPU process crashes on macOS
 // This is safe for stock dashboard apps that don't need 3D rendering
@@ -249,14 +250,21 @@ ipcMain.handle('stock-search-cn', (_event, query: string): Promise<string> => {
 
 // IPC handler for 港股实时行情
 // 数据源优先级由 settings.hkProviderPriority 控制，默认 akshare_hk
+// 注意：AKShare 港股需要缓存全量数据（约 2745 只），首次调用需要 ~55 秒
 ipcMain.handle('stock-get-hk-quote', (_event, symbols: string): Promise<string> => {
   return new Promise((resolve) => {
+    console.log('[HK DEBUG main.ts] Getting HK quote for symbols:', symbols);
     const args = [
       '--action', 'hk_quote',
       '--symbols', symbols,
       '--hk-providers', getHkProviders(),
     ];
-    runPythonScript(args, 30000, resolve);
+    console.log('[HK DEBUG main.ts] Python args:', args);
+    // 增加到 90 秒以允许 AKShare 完成缓存（首次约 55 秒，后续会使用缓存）
+    runPythonScript(args, 90000, (result) => {
+      console.log('[HK DEBUG main.ts] Python result:', result);
+      resolve(result);
+    });
   });
 });
 
@@ -278,6 +286,35 @@ ipcMain.handle('stock-get-indices', (): Promise<string> => {
 ipcMain.handle('show-notification', (_event, title: string, body: string) => {
   if (Notification.isSupported()) {
     new Notification({ title, body }).show();
+  }
+});
+
+// ── 预置股票数据加载 ──────────────────────────────────────────────────────────
+// 从 data/ 目录读取预下载的股票列表 JSON 文件
+// 用于本地搜索，提升搜索速度和体验
+
+function getPresetStockDataPath(market: 'cn' | 'hk' | 'us'): string {
+  const filename = `stocks-${market}.json`;
+  return process.env.VITE_DEV_SERVER_URL
+    ? join(__dirname, `../data/${filename}`)
+    : join(process.resourcesPath, `data/${filename}`);
+}
+
+ipcMain.handle('stock-get-preset-data', (_event, market: 'cn' | 'hk' | 'us'): string => {
+  const filePath = getPresetStockDataPath(market);
+  
+  if (!existsSync(filePath)) {
+    console.warn(`[Preset Stocks] ${market} 数据文件不存在: ${filePath}`);
+    return JSON.stringify([]);
+  }
+  
+  try {
+    const data = readFileSync(filePath, 'utf-8');
+    return data;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[Preset Stocks] 读取 ${market} 数据失败:`, message);
+    return JSON.stringify([]);
   }
 });
 

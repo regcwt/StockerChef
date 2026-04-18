@@ -178,20 +178,29 @@ def handle_hk_quote(symbols: list[str], hk_providers: list[str]) -> list[dict]:
     注意：AKShare 内部使用 tqdm 进度条，默认输出到 stdout，会污染 JSON 输出。
     通过临时将 sys.stdout 重定向到 sys.stderr，确保 stdout 只有纯 JSON。
     """
+    print(f"[HK DEBUG Python] handle_hk_quote called with symbols: {symbols}", file=sys.stderr)
+    print(f"[HK DEBUG Python] hk_providers: {hk_providers}", file=sys.stderr)
+    
     _real_stdout = sys.stdout
     sys.stdout = sys.stderr
     try:
         for provider_id in hk_providers:
             provider = _make_hk_provider(provider_id)
             if provider is None:
+                print(f"[HK DEBUG Python] Provider {provider_id} is not available", file=sys.stderr)
                 continue
             try:
+                print(f"[HK DEBUG Python] Trying provider {provider_id}...", file=sys.stderr)
                 quotes = provider.get_quotes(symbols)
+                print(f"[HK DEBUG Python] Provider {provider_id} returned {len(quotes) if quotes else 0} quotes", file=sys.stderr)
                 if quotes:
+                    print(f"[HK DEBUG Python] Provider {provider_id} quotes: {[quote_to_dict(q) for q in quotes]}", file=sys.stderr)
                     print(f"[HK Quote] 使用 {provider_id}", file=sys.stderr)
                     return [quote_to_dict(q) for q in quotes]
             except Exception as err:
+                print(f"[HK DEBUG Python] Provider {provider_id} failed: {err}", file=sys.stderr)
                 print(f"[HK Quote] {provider_id} 失败: {err}，尝试下一个", file=sys.stderr)
+        print(f"[HK DEBUG Python] All providers failed, returning empty list", file=sys.stderr)
         return []
     finally:
         sys.stdout = _real_stdout

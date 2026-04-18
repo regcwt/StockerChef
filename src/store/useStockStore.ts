@@ -218,17 +218,22 @@ export const useStockStore = create<StockState>((set, get) => ({
   },
   
   updateQuotes: (quotes: Quote[]) => {
+    console.log('[STORE DEBUG] updateQuotes called with:', quotes);
     const quotesMap = quotes.reduce((acc, quote) => {
       acc[quote.symbol] = quote;
       return acc;
     }, {} as Record<string, Quote>);
     
-    set((state) => ({
-      quotes: {
-        ...state.quotes,
-        ...quotesMap,
-      },
-    }));
+    set((state) => {
+      const newState = {
+        quotes: {
+          ...state.quotes,
+          ...quotesMap,
+        },
+      };
+      console.log('[STORE DEBUG] New quotes state:', newState.quotes);
+      return newState;
+    });
   },
   
   loadWatchlist: async () => {

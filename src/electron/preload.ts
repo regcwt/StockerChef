@@ -21,4 +21,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getHKQuote: (symbols: string) => ipcRenderer.invoke('stock-get-hk-quote', symbols),
   /** 关键指数行情（上证、科创综指、纳斯达克、标普、恒生、恒生科技，返回 JSON 字符串） */
   getIndices: () => ipcRenderer.invoke('stock-get-indices'),
+  /** 预置股票数据（本地 JSON 文件，用于快速搜索） */
+  getPresetStockData: (market: 'cn' | 'hk' | 'us') =>
+    ipcRenderer.invoke('stock-get-preset-data', market),
 });

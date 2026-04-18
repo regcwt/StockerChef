@@ -42,6 +42,12 @@ export interface ElectronAPI {
    * 返回 JSON 字符串：IndexQuote[] 或 { error, message }
    */
   getIndices: () => Promise<string>;
+  /**
+   * 获取预置股票数据（本地 JSON 文件，用于快速搜索）
+   * market: 'cn' | 'hk' | 'us'
+   * 返回 JSON 字符串：Array<{symbol: string, name: string, market: string}> 或 []
+   */
+  getPresetStockData: (market: 'cn' | 'hk' | 'us') => Promise<string>;
 }
 
 declare global {

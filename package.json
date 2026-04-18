@@ -42,7 +42,9 @@
     "files": [
       "dist/**/*",
       "dist-electron/**/*",
-      "resources/**/*"
+      "resources/**/*",
+      "data/**/*",
+      "scripts/**/*"
     ],
     "dmg": {
       "icon": "resources/icon.icns",

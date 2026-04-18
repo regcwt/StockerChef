@@ -1,0 +1,492 @@
+[
+  {
+    "symbol": "AAPL",
+    "name": "Apple Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "MSFT",
+    "name": "Microsoft Corporation",
+    "market": "美股"
+  },
+  {
+    "symbol": "GOOGL",
+    "name": "Alphabet Inc. Class A",
+    "market": "美股"
+  },
+  {
+    "symbol": "GOOG",
+    "name": "Alphabet Inc. Class C",
+    "market": "美股"
+  },
+  {
+    "symbol": "AMZN",
+    "name": "Amazon.com Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "NVDA",
+    "name": "NVIDIA Corporation",
+    "market": "美股"
+  },
+  {
+    "symbol": "META",
+    "name": "Meta Platforms Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "TSLA",
+    "name": "Tesla Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "BRK.B",
+    "name": "Berkshire Hathaway Inc. Class B",
+    "market": "美股"
+  },
+  {
+    "symbol": "V",
+    "name": "Visa Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "AMD",
+    "name": "Advanced Micro Devices Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "INTC",
+    "name": "Intel Corporation",
+    "market": "美股"
+  },
+  {
+    "symbol": "CRM",
+    "name": "Salesforce Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "ORCL",
+    "name": "Oracle Corporation",
+    "market": "美股"
+  },
+  {
+    "symbol": "CSCO",
+    "name": "Cisco Systems Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "ADBE",
+    "name": "Adobe Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "NFLX",
+    "name": "Netflix Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "PYPL",
+    "name": "PayPal Holdings Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "QCOM",
+    "name": "QUALCOMM Incorporated",
+    "market": "美股"
+  },
+  {
+    "symbol": "TXN",
+    "name": "Texas Instruments Incorporated",
+    "market": "美股"
+  },
+  {
+    "symbol": "JPM",
+    "name": "JPMorgan Chase & Co.",
+    "market": "美股"
+  },
+  {
+    "symbol": "BAC",
+    "name": "Bank of America Corporation",
+    "market": "美股"
+  },
+  {
+    "symbol": "WFC",
+    "name": "Wells Fargo & Company",
+    "market": "美股"
+  },
+  {
+    "symbol": "GS",
+    "name": "Goldman Sachs Group Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "MS",
+    "name": "Morgan Stanley",
+    "market": "美股"
+  },
+  {
+    "symbol": "C",
+    "name": "Citigroup Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "AXP",
+    "name": "American Express Company",
+    "market": "美股"
+  },
+  {
+    "symbol": "BLK",
+    "name": "BlackRock Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "SCHW",
+    "name": "Charles Schwab Corporation",
+    "market": "美股"
+  },
+  {
+    "symbol": "USB",
+    "name": "U.S. Bancorp",
+    "market": "美股"
+  },
+  {
+    "symbol": "JNJ",
+    "name": "Johnson & Johnson",
+    "market": "美股"
+  },
+  {
+    "symbol": "UNH",
+    "name": "UnitedHealth Group Incorporated",
+    "market": "美股"
+  },
+  {
+    "symbol": "PFE",
+    "name": "Pfizer Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "ABBV",
+    "name": "AbbVie Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "MRK",
+    "name": "Merck & Co. Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "TMO",
+    "name": "Thermo Fisher Scientific Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "ABT",
+    "name": "Abbott Laboratories",
+    "market": "美股"
+  },
+  {
+    "symbol": "LLY",
+    "name": "Eli Lilly and Company",
+    "market": "美股"
+  },
+  {
+    "symbol": "BMY",
+    "name": "Bristol-Myers Squibb Company",
+    "market": "美股"
+  },
+  {
+    "symbol": "AMGN",
+    "name": "Amgen Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "WMT",
+    "name": "Walmart Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "HD",
+    "name": "Home Depot Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "DIS",
+    "name": "Walt Disney Company",
+    "market": "美股"
+  },
+  {
+    "symbol": "NKE",
+    "name": "NIKE Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "MCD",
+    "name": "McDonald's Corporation",
+    "market": "美股"
+  },
+  {
+    "symbol": "SBUX",
+    "name": "Starbucks Corporation",
+    "market": "美股"
+  },
+  {
+    "symbol": "KO",
+    "name": "Coca-Cola Company",
+    "market": "美股"
+  },
+  {
+    "symbol": "PEP",
+    "name": "PepsiCo Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "COST",
+    "name": "Costco Wholesale Corporation",
+    "market": "美股"
+  },
+  {
+    "symbol": "TGT",
+    "name": "Target Corporation",
+    "market": "美股"
+  },
+  {
+    "symbol": "BA",
+    "name": "Boeing Company",
+    "market": "美股"
+  },
+  {
+    "symbol": "CAT",
+    "name": "Caterpillar Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "GE",
+    "name": "General Electric Company",
+    "market": "美股"
+  },
+  {
+    "symbol": "HON",
+    "name": "Honeywell International Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "MMM",
+    "name": "3M Company",
+    "market": "美股"
+  },
+  {
+    "symbol": "UPS",
+    "name": "United Parcel Service Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "LMT",
+    "name": "Lockheed Martin Corporation",
+    "market": "美股"
+  },
+  {
+    "symbol": "RTX",
+    "name": "RTX Corporation",
+    "market": "美股"
+  },
+  {
+    "symbol": "DE",
+    "name": "Deere & Company",
+    "market": "美股"
+  },
+  {
+    "symbol": "FDX",
+    "name": "FedEx Corporation",
+    "market": "美股"
+  },
+  {
+    "symbol": "XOM",
+    "name": "Exxon Mobil Corporation",
+    "market": "美股"
+  },
+  {
+    "symbol": "CVX",
+    "name": "Chevron Corporation",
+    "market": "美股"
+  },
+  {
+    "symbol": "COP",
+    "name": "ConocoPhillips",
+    "market": "美股"
+  },
+  {
+    "symbol": "SLB",
+    "name": "Schlumberger Limited",
+    "market": "美股"
+  },
+  {
+    "symbol": "EOG",
+    "name": "EOG Resources Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "MPC",
+    "name": "Marathon Petroleum Corporation",
+    "market": "美股"
+  },
+  {
+    "symbol": "PSX",
+    "name": "Phillips 66",
+    "market": "美股"
+  },
+  {
+    "symbol": "VLO",
+    "name": "Valero Energy Corporation",
+    "market": "美股"
+  },
+  {
+    "symbol": "OXY",
+    "name": "Occidental Petroleum Corporation",
+    "market": "美股"
+  },
+  {
+    "symbol": "HAL",
+    "name": "Halliburton Company",
+    "market": "美股"
+  },
+  {
+    "symbol": "T",
+    "name": "AT&T Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "VZ",
+    "name": "Verizon Communications Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "TMUS",
+    "name": "T-Mobile US Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "CMCSA",
+    "name": "Comcast Corporation",
+    "market": "美股"
+  },
+  {
+    "symbol": "CHTR",
+    "name": "Charter Communications Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "PARA",
+    "name": "Paramount Global",
+    "market": "美股"
+  },
+  {
+    "symbol": "WBD",
+    "name": "Warner Bros. Discovery Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "FOXA",
+    "name": "Fox Corporation Class A",
+    "market": "美股"
+  },
+  {
+    "symbol": "UBER",
+    "name": "Uber Technologies Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "LYFT",
+    "name": "Lyft Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "ABNB",
+    "name": "Airbnb Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "COIN",
+    "name": "Coinbase Global Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "SHOP",
+    "name": "Shopify Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "SQ",
+    "name": "Block Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "SNAP",
+    "name": "Snap Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "PINS",
+    "name": "Pinterest Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "SPOT",
+    "name": "Spotify Technology S.A.",
+    "market": "美股"
+  },
+  {
+    "symbol": "RBLX",
+    "name": "Roblox Corporation",
+    "market": "美股"
+  },
+  {
+    "symbol": "BABA",
+    "name": "Alibaba Group Holding Limited",
+    "market": "美股"
+  },
+  {
+    "symbol": "PDD",
+    "name": "PDD Holdings Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "JD",
+    "name": "JD.com Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "BIDU",
+    "name": "Baidu Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "NIO",
+    "name": "NIO Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "LI",
+    "name": "Li Auto Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "XPEV",
+    "name": "XPeng Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "NTES",
+    "name": "NetEase Inc.",
+    "market": "美股"
+  },
+  {
+    "symbol": "TME",
+    "name": "Tencent Music Entertainment Group",
+    "market": "美股"
+  },
+  {
+    "symbol": "BILI",
+    "name": "Bilibili Inc.",
+    "market": "美股"
+  }
+]
