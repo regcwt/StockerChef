@@ -9,15 +9,31 @@ body,
 #root {
   width: 100%;
   height: 100%;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
-    'Noto Sans', sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol',
-    'Noto Color Emoji';
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Roboto,
+    'Helvetica Neue', Arial, 'Noto Sans', sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji',
+    'Segoe UI Symbol', 'Noto Color Emoji';
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-/* Custom scrollbar */
+/* ─── Light mode background ─── */
+body {
+  background: linear-gradient(135deg, #f0f3ff 0%, #eaedfc 30%, #f4f6fb 60%, #eef0fa 100%);
+  background-attachment: fixed;
+}
+
+/* ─── Dark mode background ─── */
+@media (prefers-color-scheme: dark) {
+  body {
+    background: linear-gradient(135deg, #090d18 0%, #0d1120 40%, #0f1428 70%, #0b0f1c 100%);
+    background-attachment: fixed;
+  }
+}
+
+/* ─── Custom scrollbar ─── */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 6px;
+  height: 6px;
 }
 
 ::-webkit-scrollbar-track {
@@ -25,19 +41,161 @@ body,
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #888;
-  border-radius: 4px;
+  background: rgba(79, 110, 247, 0.3);
+  border-radius: 3px;
+  transition: background 0.2s ease;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #555;
+  background: rgba(79, 110, 247, 0.6);
 }
 
-/* Stock color utilities */
+/* ─── Stock color utilities ─── */
 .stock-up {
-  color: #52c41a;
+  color: #16a34a;
 }
 
 .stock-down {
-  color: #ff4d4f;
+  color: #dc2626;
+}
+
+/* ─── Glass card effect ─── */
+.glass-card {
+  background: rgba(255, 255, 255, 0.75) !important;
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border: 1px solid rgba(79, 110, 247, 0.12) !important;
+}
+
+@media (prefers-color-scheme: dark) {
+  .glass-card {
+    background: rgba(18, 24, 40, 0.75) !important;
+    border: 1px solid rgba(107, 132, 248, 0.12) !important;
+  }
+}
+
+/* ─── Stock card hover animation ─── */
+.stock-card {
+  transition: transform 0.22s cubic-bezier(0.34, 1.56, 0.64, 1),
+    box-shadow 0.22s ease !important;
+  cursor: pointer;
+}
+
+.stock-card:hover {
+  transform: translateY(-4px) !important;
+  box-shadow: 0 12px 40px rgba(79, 110, 247, 0.16), 0 4px 12px rgba(0, 0, 0, 0.08) !important;
+}
+
+/* ─── Gradient text for logo ─── */
+.logo-text {
+  background: linear-gradient(135deg, #4f6ef7 0%, #6b84f8 50%, #8fa3ff 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ─── Price number style ─── */
+.price-display {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+
+/* ─── Subtle shimmer loading animation ─── */
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    rgba(79, 110, 247, 0.06) 25%,
+    rgba(79, 110, 247, 0.12) 50%,
+    rgba(79, 110, 247, 0.06) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.8s infinite;
+  border-radius: 8px;
+}
+
+/* ─── Fade-in animation for cards ─── */
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.fade-in-up {
+  animation: fadeInUp 0.4s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* ─── Recommendation badge ─── */
+.recommendation-buy {
+  background: linear-gradient(135deg, #16a34a, #15803d);
+  color: white;
+  padding: 6px 20px;
+  border-radius: 24px;
+  font-weight: 700;
+  font-size: 18px;
+  display: inline-block;
+  letter-spacing: 0.05em;
+}
+
+.recommendation-sell {
+  background: linear-gradient(135deg, #dc2626, #b91c1c);
+  color: white;
+  padding: 6px 20px;
+  border-radius: 24px;
+  font-weight: 700;
+  font-size: 18px;
+  display: inline-block;
+  letter-spacing: 0.05em;
+}
+
+.recommendation-hold {
+  background: linear-gradient(135deg, #d97706, #b45309);
+  color: white;
+  padding: 6px 20px;
+  border-radius: 24px;
+  font-weight: 700;
+  font-size: 18px;
+  display: inline-block;
+  letter-spacing: 0.05em;
+}
+
+/* ─── Search result dropdown ─── */
+.search-result-item {
+  transition: background 0.15s ease, padding-left 0.15s ease;
+  border-radius: 8px;
+}
+
+.search-result-item:hover {
+  background: rgba(79, 110, 247, 0.08) !important;
+  padding-left: 20px !important;
+}
+
+/* ─── Stat mini bar ─── */
+.stat-bar {
+  height: 3px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, #4f6ef7, #a5b4fc);
+  margin-top: 4px;
+}
+
+/* ─── News item hover ─── */
+.news-item {
+  transition: background 0.15s ease, border-color 0.15s ease;
+  border-radius: 12px;
+  padding: 12px;
+  border: 1px solid transparent;
+}
+
+.news-item:hover {
+  background: rgba(79, 110, 247, 0.04);
+  border-color: rgba(79, 110, 247, 0.12);
 }

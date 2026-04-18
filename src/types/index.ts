@@ -61,3 +61,31 @@ export interface SearchResult {
   displaySymbol: string;
   type: string;
 }
+
+export interface HistoricalDataPoint {
+  date: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+export interface HistoricalDataResult {
+  data: HistoricalDataPoint[];
+  /** 数据来源：akshare（优先）、yfinance（降级）、simulated（两者均不可用时的随机模拟） */
+  source: 'akshare' | 'yfinance' | 'simulated';
+  error?: string;
+}
+
+/** 用户在分析页面输入的问题记录 */
+export interface StockQuestion {
+  /** 唯一 ID，格式：timestamp-random */
+  id: string;
+  /** 关联的股票代码 */
+  symbol: string;
+  /** 用户输入的问题内容 */
+  question: string;
+  /** 创建时间，ISO 8601 格式 */
+  createdAt: string;
+}

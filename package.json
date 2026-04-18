@@ -32,11 +32,11 @@
   "build": {
     "appId": "com.stockerchef.app",
     "productName": "StockerChef",
-    "icon": "resources/icon.png",
+    "icon": "resources/icon.icns",
     "mac": {
       "category": "public.app-category.finance",
       "target": "dmg",
-      "icon": "resources/icon.png"
+      "icon": "resources/icon.icns"
     },
     "files": [
       "dist/**/*",
@@ -44,7 +44,7 @@
       "resources/**/*"
     ],
     "dmg": {
-      "icon": "resources/icon.png",
+      "icon": "resources/icon.icns",
       "iconSize": 100,
       "contents": [
         {
