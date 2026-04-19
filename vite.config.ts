@@ -6,6 +6,7 @@ import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const isDebug = !!process.env.VITE_ELECTRON_DEBUG;
 
 export default defineConfig({
   plugins: [
@@ -13,9 +14,17 @@ export default defineConfig({
     electron([
       {
         entry: 'src/electron/main.ts',
+        onstart(args) {
+          args.startup(
+            isDebug
+              ? ['.', '--no-sandbox', '--inspect=9229']
+              : ['.', '--no-sandbox']
+          );
+        },
         vite: {
           build: {
             outDir: 'dist-electron',
+            sourcemap: true,
           },
         },
       },
@@ -27,6 +36,7 @@ export default defineConfig({
         vite: {
           build: {
             outDir: 'dist-electron',
+            sourcemap: true,
           },
         },
       },

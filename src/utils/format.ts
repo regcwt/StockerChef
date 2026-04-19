@@ -1,3 +1,6 @@
+/**
+ * 默认按美元格式化价格（保留兼容，部分场景仍直接使用，如 Analysis 美股价）。
+ */
 export const formatPrice = (price: number): string => {
   return new Intl.NumberFormat('en-US', {
     style: 'currency',
@@ -5,6 +8,35 @@ export const formatPrice = (price: number): string => {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   }).format(price);
+};
+
+/**
+ * 根据股票代码推断币种符号。
+ * - A 股（6 位纯数字）→ ¥（人民币）
+ * - 港股（XXXXX.HK）   → HK$（港币）
+ * - 其他（默认美股）   → $（美元）
+ */
+export const getCurrencySymbol = (symbol: string): string => {
+  if (/^\d{6}$/.test(symbol)) return '¥';
+  if (/\.HK$/i.test(symbol)) return 'HK$';
+  return '$';
+};
+
+/**
+ * 按股票所属市场格式化价格，自动选择币种符号（¥ / HK$ / $）。
+ *
+ * 注意：不使用 Intl.NumberFormat 的 currency 模式，
+ * 因为 HKD 在不同 locale 下渲染格式不一致（en-US 下带空格，zh-CN 下又是另一种）；
+ * 直接拼接币种符号 + 千分位数字最稳定可控。
+ */
+export const formatPriceByMarket = (price: number, symbol: string): string => {
+  const currencySign = getCurrencySymbol(symbol);
+  const sign = price < 0 ? '-' : '';
+  const formatted = new Intl.NumberFormat('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(Math.abs(price));
+  return `${sign}${currencySign}${formatted}`;
 };
 
 export const formatPercent = (percent: number): string => {

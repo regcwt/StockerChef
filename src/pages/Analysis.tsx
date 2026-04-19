@@ -1,17 +1,104 @@
-import { useState, useEffect, useRef } from 'react';
-import { Card, Tabs, Spin, Alert, Button, Modal, Typography, Space, List, Input, Tooltip, Radio } from 'antd';
-import { BarChartOutlined, RiseOutlined, FallOutlined, LinkOutlined, ClockCircleOutlined, DeleteOutlined, SendOutlined, MessageOutlined } from '@ant-design/icons';
+import { useState, useEffect, memo } from 'react';
+import { Card, Tabs, Spin, Alert, Button, Modal, Typography, Space, List, Radio } from 'antd';
+import { BarChartOutlined, RiseOutlined, FallOutlined, LinkOutlined, ClockCircleOutlined } from '@ant-design/icons';
 import { useStockQuote } from '@/hooks/useStockQuote';
 import { useStockNews } from '@/hooks/useStockNews';
-import { getProfile, getHistoricalData, handleAPIError } from '@/services/stockApi';
+import { getProfile, handleAPIError } from '@/services/stockApi';
+import { fetchKLineData } from '@/services/eastmoney';
 import { useStockStore, getChangeColors } from '@/store/useStockStore';
-import type { Stock, NewsItem, AnalysisResult, StockQuestion, HistoricalDataPoint } from '@/types';
-import { formatPrice, formatPercent, formatMarketCap, formatDate } from '@/utils/format';
+import type { Stock, NewsItem, AnalysisResult, HistoricalDataPoint } from '@/types';
+import { formatPercent, formatMarketCap, formatDate, formatPriceByMarket } from '@/utils/format';
 import KLineChart from '@/components/KLineChart';
 
 const { Title, Text, Link } = Typography;
+
+// ── 纯函数提取到组件外，避免每次渲染重新定义 ──────────────────────────────
+
+/** 计算简单移动平均（SMA）。数据不足时返回 undefined */
+const calculateSMA = (closes: number[], period: number): number | undefined => {
+  if (closes.length < period) return undefined;
+  const slice = closes.slice(closes.length - period);
+  return slice.reduce((sum, price) => sum + price, 0) / period;
+};
+
+/**
+ * 计算 RSI(14)，使用 Wilder 平滑法
+ * 数据不足 15 根 K 线时返回 undefined
+ */
+const calculateRSI = (closes: number[], period: number = 14): number | undefined => {
+  if (closes.length < period + 1) return undefined;
+
+  let gains = 0;
+  let losses = 0;
+
+  for (let index = 1; index <= period; index++) {
+    const change = closes[index] - closes[index - 1];
+    if (change > 0) {
+      gains += change;
+    } else {
+      losses += Math.abs(change);
+    }
+  }
+
+  let averageGain = gains / period;
+  let averageLoss = losses / period;
+
+  for (let index = period + 1; index < closes.length; index++) {
+    const change = closes[index] - closes[index - 1];
+    const gain = change > 0 ? change : 0;
+    const loss = change < 0 ? Math.abs(change) : 0;
+    averageGain = (averageGain * (period - 1) + gain) / period;
+    averageLoss = (averageLoss * (period - 1) + loss) / period;
+  }
+
+  if (averageLoss === 0) return 100;
+  const relativeStrength = averageGain / averageLoss;
+  return 100 - 100 / (1 + relativeStrength);
+};
+
+/** 根据 RSI 和 SMA 生成交易建议 */
+const deriveRecommendation = (
+  rsi: number | undefined,
+  currentPrice: number,
+  sma20: number | undefined,
+  sma50: number | undefined,
+): { recommendation: 'Buy' | 'Sell' | 'Hold'; summary: string } => {
+  let recommendation: 'Buy' | 'Sell' | 'Hold' = 'Hold';
+  const summaryParts: string[] = [];
+
+  if (rsi !== undefined) {
+    if (rsi < 30) {
+      recommendation = 'Buy';
+      summaryParts.push('RSI indicates oversold conditions (< 30).');
+    } else if (rsi > 70) {
+      recommendation = 'Sell';
+      summaryParts.push('RSI indicates overbought conditions (> 70).');
+    } else {
+      summaryParts.push(`RSI is neutral at ${rsi.toFixed(1)}.`);
+    }
+  }
+
+  if (sma20 !== undefined && sma50 !== undefined) {
+    if (currentPrice > sma20 && currentPrice > sma50) {
+      summaryParts.push('Price is above SMA20 and SMA50 (bullish trend).');
+      if (recommendation === 'Hold') recommendation = 'Buy';
+    } else if (currentPrice < sma20 && currentPrice < sma50) {
+      summaryParts.push('Price is below SMA20 and SMA50 (bearish trend).');
+      if (recommendation === 'Hold') recommendation = 'Sell';
+    } else {
+      summaryParts.push('Price is between SMA20 and SMA50 (mixed signals).');
+    }
+  }
+
+  if (summaryParts.length === 0) {
+    summaryParts.push('Insufficient data for analysis.');
+  }
+
+  return { recommendation, summary: summaryParts.join(' ') };
+};
+
 /** Single stat cell used in the details grid */
-const StatCell = ({
+const StatCell = memo(({
   label,
   value,
   accent = false,
@@ -44,7 +131,7 @@ const StatCell = ({
       {value}
     </div>
   </div>
-);
+));
 
 /** RSI gauge bar */
 const RsiGauge = ({ rsi }: { rsi: number }) => {
@@ -97,7 +184,7 @@ interface AnalysisProps {
 }
 
 const Analysis = ({ initialSymbol }: AnalysisProps) => {
-  const { watchlist, refreshInterval, questions, loadQuestions, addQuestion, deleteQuestion, symbolNames } = useStockStore();
+  const { watchlist, refreshInterval, symbolNames } = useStockStore();
   // 当前选中的股票 symbol，优先使用从 Dashboard 传入的 initialSymbol
   const [symbol, setSymbol] = useState<string | undefined>(initialSymbol || watchlist[0]);
 
@@ -107,6 +194,13 @@ const Analysis = ({ initialSymbol }: AnalysisProps) => {
       setSymbol(initialSymbol);
     }
   }, [initialSymbol]);
+
+  // watchlist 异步加载完成后的兜底：若 symbol 仍为空，自动选中第一个
+  useEffect(() => {
+    if (!symbol && watchlist.length > 0) {
+      setSymbol(watchlist[0]);
+    }
+  }, [symbol, watchlist]);
 
   const { quote, loading: quoteLoading, error: quoteError } = useStockQuote(symbol || '', refreshInterval * 1000);
   const { news, loading: newsLoading, error: newsError } = useStockNews(symbol || '');
@@ -124,23 +218,20 @@ const Analysis = ({ initialSymbol }: AnalysisProps) => {
   /** 时间范围：1M / 3M / 6M / 1Y */
   const [klineRange, setKlineRange] = useState<'1M' | '3M' | '6M' | '1Y'>('3M');
 
-  // ── 问答区域状态 ──────────────────────────────────────────────────────
-  const [questionInput, setQuestionInput] = useState('');
-  const [selectedQuestion, setSelectedQuestion] = useState<StockQuestion | null>(null);
-  const questionInputRef = useRef<HTMLTextAreaElement>(null);
-
   // ── K 线图数据加载 ────────────────────────────────────────────────────
-  const rangeTodays: Record<string, number> = { '1M': 30, '3M': 90, '6M': 180, '1Y': 365 };
+  // rangeTodays 提取为模块级常量，避免每次渲染重新创建
+  const RANGE_TO_DAYS: Record<string, number> = { '1M': 30, '3M': 90, '6M': 180, '1Y': 365 };
 
   const loadKlineData = async (targetSymbol: string, range: '1M' | '3M' | '6M' | '1Y') => {
     setKlineLoading(true);
     setKlineError(null);
     try {
       const endDate = new Date().toISOString().split('T')[0];
-      const startDate = new Date(Date.now() - rangeTodays[range] * 24 * 60 * 60 * 1000)
+      const startDate = new Date(Date.now() - RANGE_TO_DAYS[range] * 24 * 60 * 60 * 1000)
         .toISOString()
         .split('T')[0];
-      const result = await getHistoricalData(targetSymbol, startDate, endDate);
+      // 渲染进程直接调用东方财富 K 线接口，无需走 IPC
+      const result = await fetchKLineData(targetSymbol, startDate, endDate);
       setKlineData(result.data);
       setKlineSource(result.source);
     } catch (err: any) {
@@ -155,21 +246,6 @@ const Analysis = ({ initialSymbol }: AnalysisProps) => {
     if (!symbol) return;
     loadKlineData(symbol, klineRange);
   }, [symbol, klineRange]);
-
-  // 加载历史问题
-  useEffect(() => {
-    loadQuestions();
-  }, []);
-
-  // 当前 symbol 的历史问题（最新在前）
-  const currentSymbolQuestions = questions.filter((q) => q.symbol === symbol);
-
-  const handleSubmitQuestion = async () => {
-    const trimmed = questionInput.trim();
-    if (!trimmed || !symbol) return;
-    await addQuestion(symbol, trimmed);
-    setQuestionInput('');
-  };
 
   useEffect(() => {
     if (!symbol) return;
@@ -186,102 +262,8 @@ const Analysis = ({ initialSymbol }: AnalysisProps) => {
     };
     fetchProfile();
   }, [symbol]);
-
-  // ── 技术指标计算工具函数 ──────────────────────────────────────────────
-
-  /** 计算简单移动平均（SMA）。数据不足时返回 undefined */
-  const calculateSMA = (closes: number[], period: number): number | undefined => {
-    if (closes.length < period) return undefined;
-    const slice = closes.slice(closes.length - period);
-    return slice.reduce((sum, price) => sum + price, 0) / period;
-  };
-
-  /**
-   * 计算 RSI(14)
-   * 参考 TradingAgents-CN 的技术分析逻辑，使用 Wilder 平滑法
-   * 数据不足 15 根 K 线时返回 undefined
-   */
-  const calculateRSI = (closes: number[], period: number = 14): number | undefined => {
-    if (closes.length < period + 1) return undefined;
-
-    let gains = 0;
-    let losses = 0;
-
-    // 计算初始平均涨跌幅（第一个 period 段）
-    for (let index = 1; index <= period; index++) {
-      const change = closes[index] - closes[index - 1];
-      if (change > 0) {
-        gains += change;
-      } else {
-        losses += Math.abs(change);
-      }
-    }
-
-    let averageGain = gains / period;
-    let averageLoss = losses / period;
-
-    // Wilder 平滑法：对剩余数据进行指数平滑
-    for (let index = period + 1; index < closes.length; index++) {
-      const change = closes[index] - closes[index - 1];
-      const gain = change > 0 ? change : 0;
-      const loss = change < 0 ? Math.abs(change) : 0;
-      averageGain = (averageGain * (period - 1) + gain) / period;
-      averageLoss = (averageLoss * (period - 1) + loss) / period;
-    }
-
-    if (averageLoss === 0) return 100;
-    const relativeStrength = averageGain / averageLoss;
-    return 100 - 100 / (1 + relativeStrength);
-  };
-
-  /** 根据 RSI 和 SMA 生成交易建议 */
-  const deriveRecommendation = (
-    rsi: number | undefined,
-    currentPrice: number,
-    sma20: number | undefined,
-    sma50: number | undefined,
-  ): { recommendation: 'Buy' | 'Sell' | 'Hold'; summary: string } => {
-    let recommendation: 'Buy' | 'Sell' | 'Hold' = 'Hold';
-    const summaryParts: string[] = [];
-
-    if (rsi !== undefined) {
-      if (rsi < 30) {
-        recommendation = 'Buy';
-        summaryParts.push('RSI indicates oversold conditions (< 30).');
-      } else if (rsi > 70) {
-        recommendation = 'Sell';
-        summaryParts.push('RSI indicates overbought conditions (> 70).');
-      } else {
-        summaryParts.push(`RSI is neutral at ${rsi.toFixed(1)}.`);
-      }
-    }
-
-    if (sma20 !== undefined && sma50 !== undefined) {
-      if (currentPrice > sma20 && currentPrice > sma50) {
-        summaryParts.push('Price is above SMA20 and SMA50 (bullish trend).');
-        if (recommendation === 'Hold') recommendation = 'Buy';
-      } else if (currentPrice < sma20 && currentPrice < sma50) {
-        summaryParts.push('Price is below SMA20 and SMA50 (bearish trend).');
-        if (recommendation === 'Hold') recommendation = 'Sell';
-      } else {
-        summaryParts.push('Price is between SMA20 and SMA50 (mixed signals).');
-      }
-    }
-
-    if (summaryParts.length === 0) {
-      summaryParts.push('Insufficient data for analysis.');
-    }
-
-    return { recommendation, summary: summaryParts.join(' ') };
-  };
-
   // ── 技术分析入口 ──────────────────────────────────────────────────────
 
-  /**
-   * 生成技术分析
-   * 优先使用 yfinance 真实历史数据计算 RSI/SMA
-   * yfinance 不可用时（限流/网络问题）降级为随机模拟，并在 UI 明确标注
-   */
   const generateAnalysis = async () => {
     if (!quote || !symbol) return;
 
@@ -294,7 +276,8 @@ const Analysis = ({ initialSymbol }: AnalysisProps) => {
         .toISOString()
         .split('T')[0];
 
-      const histResult = await getHistoricalData(symbol, startDate, endDate);
+      // 渲染进程直接调用东方财富 K 线接口，无需走 IPC
+      const histResult = await fetchKLineData(symbol, startDate, endDate);
       const closes = histResult.data.map((point) => point.close);
 
       let rsi: number | undefined;
@@ -302,16 +285,16 @@ const Analysis = ({ initialSymbol }: AnalysisProps) => {
       let sma50: number | undefined;
       let sma200: number | undefined;
 
-      const useRealData = histResult.source !== 'simulated' && closes.length >= 15;
+      const useRealData = closes.length >= 15;
 
       if (useRealData) {
-        // ✅ 真实历史数据（AKShare 或 yfinance）：计算真实指标
+        // ✅ 真实历史数据（东方财富 K 线接口）：计算真实指标
         rsi = calculateRSI(closes, 14);
         sma20 = calculateSMA(closes, 20);
         sma50 = calculateSMA(closes, 50);
         sma200 = calculateSMA(closes, 200);
       } else {
-        // ⚠️ 所有数据源均不可用（限流/网络问题）：降级为随机模拟
+        // ⚠️ 数据不足（网络问题/新股）：降级为随机模拟
         const currentPrice = quote.price;
         rsi = 30 + Math.random() * 40;
         sma20 = currentPrice * (0.95 + Math.random() * 0.1);
@@ -321,12 +304,8 @@ const Analysis = ({ initialSymbol }: AnalysisProps) => {
 
       const { recommendation, summary } = deriveRecommendation(rsi, quote.price, sma20, sma50);
 
-      // 标注数据来源：真实数据标注数据源，模拟数据加免责声明
-      const sourceLabel = histResult.source === 'akshare'
-        ? '[AKShare] '
-        : histResult.source === 'yfinance'
-          ? '[yfinance] '
-          : '[SIMULATED DATA] ';
+      // 标注数据来源
+      const sourceLabel = useRealData ? '[EastMoney] ' : '[SIMULATED DATA] ';
 
       setAnalysis({
         symbol,
@@ -348,159 +327,90 @@ const Analysis = ({ initialSymbol }: AnalysisProps) => {
   const isPositive = quote ? quote.change >= 0 : true;
   const accentColor = isPositive ? upColor : downColor;
 
-  // 没有选中股票时，显示空状态引导用户选择
+  // 没有自选股时，显示引导页面
   if (!symbol) {
+    const hasWatchlist = watchlist.length > 0;
     return (
       <div
         style={{
-          maxWidth: 1100,
+          maxWidth: 800,
           margin: '0 auto',
           display: 'flex',
           flexDirection: 'column',
           alignItems: 'center',
           justifyContent: 'center',
           minHeight: '60vh',
-          gap: 16,
+          gap: 32,
+          padding: '40px 24px',
         }}
       >
-        <div style={{ fontSize: 56 }}>📊</div>
-        <div style={{ fontWeight: 700, fontSize: 22, color: '#0f1a2e', letterSpacing: '-0.02em' }}>
-          选择一只股票开始分析
+        {/* 主图标 */}
+        <div
+          style={{
+            width: 96,
+            height: 96,
+            borderRadius: 28,
+            background: 'linear-gradient(135deg, rgba(79,110,247,0.12), rgba(79,110,247,0.06))',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            fontSize: 48,
+            border: '1px solid rgba(79,110,247,0.15)',
+          }}
+        >
+          📊
         </div>
-        <div style={{ fontSize: 14, color: '#6b7fa8' }}>
-          请先在首页添加自选股，然后点击股票卡片进入分析
+
+        {/* 标题 + 副标题 */}
+        <div style={{ textAlign: 'center', maxWidth: 480 }}>
+          <div style={{ fontWeight: 800, fontSize: 24, color: '#0f1a2e', letterSpacing: '-0.03em', marginBottom: 10 }}>
+            {hasWatchlist ? '点击股票卡片开始分析' : '添加自选股开始分析'}
+          </div>
+          <div style={{ fontSize: 14, color: '#6b7fa8', lineHeight: 1.7 }}>
+            {hasWatchlist
+              ? '在「自选股」页面点击任意股票卡片，即可在此查看 K 线图、实时报价和技术分析'
+              : '在「自选股」页面搜索并添加股票，然后点击卡片进入详情分析'}
+          </div>
+        </div>
+
+        {/* 功能介绍卡片 */}
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(3, 1fr)',
+            gap: 16,
+            width: '100%',
+            maxWidth: 600,
+          }}
+        >
+          {[
+            { icon: '📈', title: 'K 线图', desc: '1月/3月/6月/1年历史走势' },
+            { icon: '⚡', title: '实时报价', desc: '自动轮询最新价格和涨跌' },
+            { icon: '🔬', title: '技术分析', desc: 'RSI、SMA20/50/200 指标' },
+          ].map(({ icon, title, desc }) => (
+            <div
+              key={title}
+              style={{
+                padding: '20px 16px',
+                borderRadius: 16,
+                background: 'rgba(255,255,255,0.7)',
+                border: '1px solid rgba(79,110,247,0.1)',
+                textAlign: 'center',
+                backdropFilter: 'blur(8px)',
+              }}
+            >
+              <div style={{ fontSize: 28, marginBottom: 8 }}>{icon}</div>
+              <div style={{ fontWeight: 700, fontSize: 13, color: '#1a2e22', marginBottom: 4 }}>{title}</div>
+              <div style={{ fontSize: 11, color: '#8a9cc8', lineHeight: 1.5 }}>{desc}</div>
+            </div>
+          ))}
         </div>
       </div>
     );
   }
 
   return (
-    <div style={{ display: 'flex', gap: 0, height: 'calc(100vh - 80px)', overflow: 'hidden' }}>
-
-      {/* ── 左侧：历史问题列表 ── */}
-      <div
-        style={{
-          width: 220,
-          minWidth: 220,
-          flexShrink: 0,
-          display: 'flex',
-          flexDirection: 'column',
-          background: 'rgba(248, 250, 255, 0.7)',
-          backdropFilter: 'blur(12px)',
-          borderRight: '1px solid rgba(79, 110, 247, 0.1)',
-          overflow: 'hidden',
-        }}
-      >
-        {/* 左侧标题 */}
-        <div
-          style={{
-            padding: '18px 16px 12px',
-            borderBottom: '1px solid rgba(79, 110, 247, 0.08)',
-            flexShrink: 0,
-          }}
-        >
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <MessageOutlined style={{ color: '#4f6ef7', fontSize: 14 }} />
-            <span style={{ fontWeight: 700, fontSize: 13, color: '#0f1a2e' }}>历史问题</span>
-          </div>
-          {symbol && (
-            <div style={{ fontSize: 11, color: '#8a9cc8', marginTop: 4 }}>
-              {symbol} · {currentSymbolQuestions.length} 条
-            </div>
-          )}
-        </div>
-
-        {/* 问题列表 */}
-        <div style={{ flex: 1, overflowY: 'auto', padding: '8px 0' }}>
-          {currentSymbolQuestions.length === 0 ? (
-            <div
-              style={{
-                padding: '32px 16px',
-                textAlign: 'center',
-                color: '#a0aec8',
-                fontSize: 12,
-                lineHeight: 1.6,
-              }}
-            >
-              <div style={{ fontSize: 24, marginBottom: 8 }}>💬</div>
-              <div>还没有问题记录</div>
-              <div>在下方输入框提问</div>
-            </div>
-          ) : (
-            currentSymbolQuestions.map((q) => (
-              <div
-                key={q.id}
-                onClick={() => setSelectedQuestion(selectedQuestion?.id === q.id ? null : q)}
-                style={{
-                  padding: '10px 14px',
-                  margin: '2px 6px',
-                  borderRadius: 10,
-                  cursor: 'pointer',
-                  background: selectedQuestion?.id === q.id
-                    ? 'rgba(79, 110, 247, 0.1)'
-                    : 'transparent',
-                  border: selectedQuestion?.id === q.id
-                    ? '1px solid rgba(79, 110, 247, 0.2)'
-                    : '1px solid transparent',
-                  transition: 'all 0.15s ease',
-                  position: 'relative',
-                }}
-              >
-                <div
-                  style={{
-                    fontSize: 12,
-                    color: selectedQuestion?.id === q.id ? '#4f6ef7' : '#2d3a52',
-                    fontWeight: 500,
-                    lineHeight: 1.4,
-                    overflow: 'hidden',
-                    display: '-webkit-box',
-                    WebkitLineClamp: 2,
-                    WebkitBoxOrient: 'vertical',
-                    marginBottom: 4,
-                    paddingRight: 20,
-                  }}
-                >
-                  {q.question}
-                </div>
-                <div style={{ fontSize: 10, color: '#a0aec8' }}>
-                  {new Date(q.createdAt).toLocaleDateString('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
-                </div>
-                <Tooltip title="删除">
-                  <div
-                    onClick={(e) => { e.stopPropagation(); deleteQuestion(q.id); }}
-                    style={{
-                      position: 'absolute',
-                      top: 8,
-                      right: 8,
-                      width: 20,
-                      height: 20,
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      borderRadius: 6,
-                      color: '#c0cce0',
-                      fontSize: 11,
-                      cursor: 'pointer',
-                      transition: 'all 0.15s',
-                    }}
-                    onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.color = '#dc2626'; (e.currentTarget as HTMLDivElement).style.background = 'rgba(220,38,38,0.08)'; }}
-                    onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.color = '#c0cce0'; (e.currentTarget as HTMLDivElement).style.background = 'transparent'; }}
-                  >
-                    <DeleteOutlined />
-                  </div>
-                </Tooltip>
-              </div>
-            ))
-          )}
-        </div>
-      </div>
-
-      {/* ── 右侧：主内容区 + 底部输入框 ── */}
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', minWidth: 0 }}>
-
-        {/* 主内容滚动区 */}
-        <div style={{ flex: 1, overflowY: 'auto', padding: '0 24px' }}>
-          <div style={{ maxWidth: 1000, margin: '0 auto' }}>
+    <div style={{ maxWidth: 1000, margin: '0 auto' }}>
 
       {/* ── 股票切换选择器 ── */}
       {watchlist.length > 0 && (
@@ -516,29 +426,37 @@ const Analysis = ({ initialSymbol }: AnalysisProps) => {
           <span style={{ fontSize: 13, color: '#8a9cc8', fontWeight: 500, marginRight: 4 }}>
             切换股票：
           </span>
-          {watchlist.map((ticker) => (
-            <div
-              key={ticker}
-              onClick={() => setSymbol(ticker)}
-              style={{
-                padding: '5px 14px',
-                borderRadius: 20,
-                fontSize: 13,
-                fontWeight: ticker === symbol ? 700 : 500,
-                cursor: 'pointer',
-                background: ticker === symbol
-                  ? 'rgba(79, 110, 247, 0.12)'
-                  : 'rgba(255, 255, 255, 0.6)',
-                color: ticker === symbol ? '#4f6ef7' : '#5a6a8a',
-                border: ticker === symbol
-                  ? '1px solid rgba(79, 110, 247, 0.3)'
-                  : '1px solid rgba(79, 110, 247, 0.1)',
-                transition: 'all 0.18s ease',
-              }}
-            >
-              {ticker}
-            </div>
-          ))}
+          {watchlist.map((ticker) => {
+            const isAStock = /\.(SZ|SH|BJ)$/i.test(ticker) || /^\d{6}$/.test(ticker);
+            const isHKStock = /\.HK$/i.test(ticker);
+            const displayLabel =
+              (isAStock || isHKStock) && symbolNames[ticker]
+                ? symbolNames[ticker]
+                : ticker;
+            return (
+              <div
+                key={ticker}
+                onClick={() => setSymbol(ticker)}
+                style={{
+                  padding: '5px 14px',
+                  borderRadius: 20,
+                  fontSize: 13,
+                  fontWeight: ticker === symbol ? 700 : 500,
+                  cursor: 'pointer',
+                  background: ticker === symbol
+                    ? 'rgba(79, 110, 247, 0.12)'
+                    : 'rgba(255, 255, 255, 0.6)',
+                  color: ticker === symbol ? '#4f6ef7' : '#5a6a8a',
+                  border: ticker === symbol
+                    ? '1px solid rgba(79, 110, 247, 0.3)'
+                    : '1px solid rgba(79, 110, 247, 0.1)',
+                  transition: 'all 0.18s ease',
+                }}
+              >
+                {displayLabel}
+              </div>
+            );
+          })}
         </div>
       )}
 
@@ -614,7 +532,7 @@ const Analysis = ({ initialSymbol }: AnalysisProps) => {
                       marginBottom: 10,
                     }}
                   >
-                    {formatPrice(quote.price)}
+                    {formatPriceByMarket(quote.price, symbol)}
                   </div>
                   <div
                     style={{
@@ -635,7 +553,7 @@ const Analysis = ({ initialSymbol }: AnalysisProps) => {
                     }
                     {formatPercent(quote.changePercent)}
                     <span style={{ opacity: 0.7, fontWeight: 500 }}>
-                      ({formatPrice(quote.change)})
+                      ({formatPriceByMarket(quote.change, symbol)})
                     </span>
                   </div>
                 </div>
@@ -676,10 +594,10 @@ const Analysis = ({ initialSymbol }: AnalysisProps) => {
                 marginTop: 24,
               }}
             >
-              <StatCell label="Open" value={formatPrice(quote.open || 0)} />
-              <StatCell label="Prev Close" value={formatPrice(quote.previousClose || 0)} />
-              <StatCell label="Day High" value={formatPrice(quote.high || 0)} accent />
-              <StatCell label="Day Low" value={formatPrice(quote.low || 0)} />
+              <StatCell label="Open" value={formatPriceByMarket(quote.open || 0, symbol)} />
+              <StatCell label="Prev Close" value={formatPriceByMarket(quote.previousClose || 0, symbol)} />
+              <StatCell label="Day High" value={formatPriceByMarket(quote.high || 0, symbol)} accent />
+              <StatCell label="Day Low" value={formatPriceByMarket(quote.low || 0, symbol)} />
             </div>
           )}
         </div>
@@ -755,51 +673,60 @@ const Analysis = ({ initialSymbol }: AnalysisProps) => {
               ),
               children: (
                 <div>
-                  {profileLoading ? (
-                    <div style={{ textAlign: 'center', padding: 40 }}>
-                      <Spin size="large" />
+                  {profileLoading && (
+                    <div style={{ textAlign: 'center', padding: 20 }}>
+                      <Spin size="small" />
                     </div>
-                  ) : profile ? (
-                    <div
-                      style={{
-                        display: 'grid',
-                        gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))',
-                        gap: 12,
-                      }}
-                    >
-                      <StatCell label="Company Name" value={profile.name || 'N/A'} accent />
-                      <StatCell label="Symbol" value={symbol} />
-                      <StatCell
-                        label="Market Cap ⚠️"
-                        value={profile.marketCap ? formatMarketCap(profile.marketCap) : 'N/A'}
-                      />
-                      <StatCell label="Industry" value={profile.description || 'N/A'} />
-                      <StatCell label="Open" value={quote ? formatPrice(quote.open || 0) : 'N/A'} />
-                      <StatCell
-                        label="Prev Close"
-                        value={quote ? formatPrice(quote.previousClose || 0) : 'N/A'}
-                      />
-                      <StatCell
-                        label="Day High"
-                        value={quote ? formatPrice(quote.high || 0) : 'N/A'}
-                        accent
-                      />
-                      <StatCell
-                        label="Day Low"
-                        value={quote ? formatPrice(quote.low || 0) : 'N/A'}
-                      />
-                      <StatCell
-                        label="Volume"
-                        value={quote?.volume ? quote.volume.toLocaleString() : 'N/A'}
-                      />
-                      <StatCell
-                        label="Last Updated"
-                        value={quote ? formatDate(quote.timestamp) : 'N/A'}
-                      />
-                    </div>
-                  ) : (
-                    <Alert message="Failed to load company profile" type="error" />
                   )}
+                  {/* quote 数据始终展示，不依赖 Finnhub Key */}
+                  <div
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))',
+                      gap: 12,
+                    }}
+                  >
+                    {/* profile 字段：仅美股且配置了 Finnhub Key 时有值 */}
+                    <StatCell
+                      label="Company Name"
+                      value={profile?.name || symbolNames[symbol] || symbol}
+                      accent
+                    />
+                    <StatCell label="Symbol" value={symbol} />
+                    {profile?.marketCap && (
+                      <StatCell
+                        label="Market Cap"
+                        value={formatMarketCap(profile.marketCap)}
+                      />
+                    )}
+                    {profile?.description && (
+                      <StatCell label="Industry" value={profile.description} />
+                    )}
+                    {/* quote 字段：A股/港股/美股均有 */}
+                    <StatCell label="Price" value={quote ? formatPriceByMarket(quote.price, symbol) : '—'} accent />
+                    <StatCell label="Open" value={quote ? formatPriceByMarket(quote.open || 0, symbol) : '—'} />
+                    <StatCell
+                      label="Prev Close"
+                      value={quote ? formatPriceByMarket(quote.previousClose || 0, symbol) : '—'}
+                    />
+                    <StatCell
+                      label="Day High"
+                      value={quote ? formatPriceByMarket(quote.high || 0, symbol) : '—'}
+                      accent
+                    />
+                    <StatCell
+                      label="Day Low"
+                      value={quote ? formatPriceByMarket(quote.low || 0, symbol) : '—'}
+                    />
+                    <StatCell
+                      label="Volume"
+                      value={quote?.volume ? quote.volume.toLocaleString() : '—'}
+                    />
+                    <StatCell
+                      label="Last Updated"
+                      value={quote ? formatDate(quote.timestamp) : '—'}
+                    />
+                  </div>
                 </div>
               ),
             },
@@ -996,90 +923,6 @@ const Analysis = ({ initialSymbol }: AnalysisProps) => {
         )}
       </Modal>
 
-          </div>{/* end maxWidth wrapper */}
-        </div>{/* end 主内容滚动区 */}
-
-        {/* ── 底部：问题输入框 ── */}
-        <div
-          style={{
-            flexShrink: 0,
-            padding: '12px 24px 16px',
-            borderTop: '1px solid rgba(79, 110, 247, 0.1)',
-            background: 'rgba(248, 250, 255, 0.8)',
-            backdropFilter: 'blur(12px)',
-          }}
-        >
-          {selectedQuestion && (
-            <div
-              style={{
-                marginBottom: 10,
-                padding: '10px 14px',
-                background: 'rgba(79, 110, 247, 0.06)',
-                borderRadius: 10,
-                border: '1px solid rgba(79, 110, 247, 0.15)',
-                fontSize: 12,
-                color: '#4f6ef7',
-                display: 'flex',
-                alignItems: 'flex-start',
-                gap: 8,
-              }}
-            >
-              <MessageOutlined style={{ marginTop: 1, flexShrink: 0 }} />
-              <span style={{ flex: 1, lineHeight: 1.5 }}>{selectedQuestion.question}</span>
-              <span
-                onClick={() => setSelectedQuestion(null)}
-                style={{ cursor: 'pointer', color: '#a0aec8', flexShrink: 0 }}
-              >
-                ✕
-              </span>
-            </div>
-          )}
-          <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
-            <Input.TextArea
-              ref={questionInputRef}
-              value={questionInput}
-              onChange={(e) => setQuestionInput(e.target.value)}
-              placeholder={symbol ? `关于 ${symbol} 的问题，记录下来稍后分析…` : '请先选择一只股票'}
-              disabled={!symbol}
-              autoSize={{ minRows: 1, maxRows: 4 }}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault();
-                  handleSubmitQuestion();
-                }
-              }}
-              style={{
-                flex: 1,
-                borderRadius: 12,
-                fontSize: 13,
-                border: '1px solid rgba(79, 110, 247, 0.2)',
-                background: 'rgba(255,255,255,0.9)',
-                resize: 'none',
-              }}
-            />
-            <Button
-              type="primary"
-              icon={<SendOutlined />}
-              onClick={handleSubmitQuestion}
-              disabled={!symbol || !questionInput.trim()}
-              style={{
-                borderRadius: 12,
-                height: 38,
-                width: 38,
-                padding: 0,
-                background: 'linear-gradient(135deg, #4f6ef7, #6b84f8)',
-                border: 'none',
-                boxShadow: '0 4px 12px rgba(79, 110, 247, 0.3)',
-                flexShrink: 0,
-              }}
-            />
-          </div>
-          <div style={{ fontSize: 11, color: '#a0aec8', marginTop: 6, textAlign: 'right' }}>
-            Enter 发送 · Shift+Enter 换行
-          </div>
-        </div>
-
-      </div>{/* end 右侧主内容区 */}
     </div>
   );
 };

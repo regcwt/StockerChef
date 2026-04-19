@@ -24,13 +24,15 @@
 - **这是什么**：macOS 桌面股票看板应用，基于 Electron + React + TypeScript 构建
 - **核心功能**：自选股实时行情监控（10s 轮询）、股票新闻聚合、真实技术分析（RSI/SMA，基于历史 K 线数据）
 - **数据来源**：
-  - A 股实时行情：Tushare Pro（有 Token 时优先）→ AKShare stock_zh_a_hist_tx（腾讯财经，降级）
-  - 港股实时行情：AKShare stock_hk_spot（新浪财经，10min 缓存）→ 降级 stock_hk_daily（stock_hk_spot 在部分网络环境下不可用，降级链总耗时约 10s，前端超时设为 35s）
-  - 美股实时报价：Finnhub 免费 API（仅支持美股，60次/分钟限额）
-  - A 股历史 K 线：Tushare daily（有 Token）→ AKShare stock_zh_a_hist_tx（腾讯财经，降级）
-  - 港股历史 K 线：AKShare stock_hk_daily（新浪财经）
-  - 美股历史 K 线：yfinance → 随机模拟（网络不通时）
-  - **Python 数据层**：`scripts/providers/` 包（多 Provider 类架构，参考 TradingAgents-CN）
+  - **统一实时行情（首页用）**：东方财富 push2 HTTP API `fetchQuotes(symbols)`（`src/services/eastmoney.ts`），一次请求拿混合市场的所有自选股行情，**调用方无需按市场分组**；内部按 symbol 自动派发 secid：
+    - A 股 (6 位纯数字) → `0./1.XXXXXX`
+    - 港股 (XXXXX.HK) → `116.XXXXX`（5 位左补零）
+    - 美股 (其他) → `105./106.TICKER`（按 ticker 白名单精准选择，未命中时自动用另一市场补一次）
+  - 单市场专用：`fetchCNQuotes` / `fetchHKQuotes` / `fetchUSQuotes` 仍保留，供 Analysis 页 `useStockQuote` 等单市场场景使用
+  - 失败链：东方财富不可用时降级到 Python Provider 链（`scripts/providers/`）
+  - A 股/港股/美股历史 K 线：东方财富 K 线 API（`fetchKLineData()`，`push2his.eastmoney.com`，渲染进程直接 fetch，前复权日 K）→ 降级随机模拟
+  - 指数行情：东方财富 push2 HTTP API（`fetchIndices()`，8 个预设指数：上证/深成/创业板/纳斯达克/标普500/道琼斯/恒生/恒生科技）→ 降级 Python Provider 链
+  - **Python 数据层**（降级用）：`scripts/providers/` 包（多 Provider 类架构，参考 TradingAgents-CN）
 - **持久化**：自选股列表通过 IPC 存储在 `electron-store`，路径 `~/Library/Application Support/stocker-chef/`
 - **⚠️ 重要限制**：历史数据依赖网络可用性，网络不通时技术分析降级为随机模拟数据；仅支持 macOS 打包
 
@@ -43,15 +45,12 @@
 npm install
 
 # 配置 Finnhub API Key（可选，两种方式二选一）
-# 方式一：在应用内 Settings → Data Sources 页面输入并保存（推荐，无需重启）
-# 方式二：通过 .env 文件配置（开发调试用）
-cp .env.example .env
-# 编辑 .env，填入 VITE_STOCK_API_KEY=your_finnhub_api_key
+# 在应用内 Settings → Data Sources 页面输入并保存（推荐，无需重启）
 
 # 注意：不配置 Finnhub Key 时，历史 K 线和技术分析（AKShare/yfinance）仍可正常使用
 # 仅搜索、实时报价、新闻功能需要 Finnhub Key
 
-# 启动开发模式（同时启动 Vite dev server + Electron）
+# 启动开发模式（同时启动 Vite + Electron）
 npm run dev
 
 # 生产构建：依次执行 tsc 类型检查 → vite build → electron-builder 打包
@@ -124,16 +123,16 @@ Finnhub Key 是**可选配置**，Key 缺失时各功能的正确降级行为如
 
 ### 3.3 技术分析数据来源说明（已升级为真实计算）
 
-`Analysis.tsx` 中的 RSI(14)、SMA20、SMA50、SMA200 现在基于 AKShare/yfinance 的真实历史 K 线数据计算。
+`Analysis.tsx` 中的 RSI(14)、SMA20、SMA50、SMA200 现在基于东方财富 K 线 API（`fetchKLineData()`）的真实历史 K 线数据计算。
 
 **降级规则**：
-- AKShare 或 yfinance 可用 → 真实计算，UI 标注 `[AKShare]` 或 `[yfinance]`
-- 两者均不可用（网络断开）→ 降级为随机模拟，UI 标注 `[SIMULATED DATA]`
+- 东方财富 K 线接口可用（数据 ≥ 15 根）→ 真实计算，UI 标注 `[EastMoney]`
+- 数据不足（网络问题/新股）→ 降级为随机模拟，UI 标注 `[SIMULATED DATA]`
 
 **禁止**：
 - 将技术分析结果存入持久化存储（每次点击按钮重新计算）
-- 在 UI 上去掉数据来源标注（`[AKShare]` / `[yfinance]` / `[SIMULATED DATA]`）
-- 基于模拟数据（`source === 'simulated'`）做任何业务逻辑判断
+- 在 UI 上去掉数据来源标注（`[EastMoney]` / `[SIMULATED DATA]`）
+- 基于模拟数据做任何业务逻辑判断
 
 ### 3.4 watchlist 存储 key 不可更改
 
@@ -149,17 +148,9 @@ Finnhub Key 是**可选配置**，Key 缺失时各功能的正确降级行为如
 
 原因：Finnhub API 对大小写敏感，小写 symbol 会返回空数据。`addToWatchlist()` 已处理此逻辑，直接调用该方法即可，不要绕过它手动操作 `watchlist` 数组。
 
-### 3.6 marketCap 展示单位存在 Bug，禁止在此基础上做计算
+### 3.6 marketCap 展示单位（已修复）
 
-`src/services/stockApi.ts` 的 `getProfile()` 将 Finnhub 返回的 `marketCapitalization`（单位：百万美元）直接赋值给 `Stock.marketCap`，而 `src/utils/format.ts` 的 `formatMarketCap()` 将其当作美元处理，导致展示值偏小 100 万倍。
-
-原因：这是初始实现时的单位理解错误，已记录为已知 Bug。
-
-**禁止**：
-- 基于 `Stock.marketCap` 做任何数值比较或业务计算（数值不可信）
-- 在修复此 Bug 前，将 `marketCap` 存入持久化存储
-
-**修复方式**：在 `getProfile()` 中将 `data.marketCapitalization` 乘以 `1_000_000` 后再赋值，或修改 `formatMarketCap()` 使其接受百万美元单位的输入。详见 `docs/known-issues/market-cap-unit-mismatch.md`。
+`src/utils/format.ts` 的 `formatMarketCap()` 现在接受百万美元单位的输入（与 Finnhub `getProfile()` 返回的 `marketCapitalization` 单位一致），内部乘以 `1_000_000` 后再做 T/B/M/K 换算。此 Bug 已修复。
 
 ### 3.7 新闻缓存不可跨 symbol 共享
 
@@ -202,15 +193,26 @@ export const darkTheme: ThemeConfig = {
 | `store-set` | renderer → main | `key: string, value: unknown` | `true` |
 | `settings-get` | renderer → main | `key: string` | `unknown`（用户设置值） |
 | `settings-set` | renderer → main | `key: string, value: unknown` | `true` |
-| `stock-get-history` | renderer → main | `symbol: string, startDate: string, endDate: string` | JSON 字符串 |
+| `stock-get-history` | renderer → main | `symbol, startDate, endDate`（内部追加 `--cn-providers`/`--hk-providers`/`--us-providers` + Token 参数） | JSON 字符串 |
 | `stock-get-cn-quote` | renderer → main | `symbols: string`（逗号分隔 6 位代码） | JSON 字符串（`Quote[]`） |
 | `stock-search-cn` | renderer → main | `query: string` | JSON 字符串（`SearchResult[]`） |
 | `stock-get-hk-quote` | renderer → main | `symbols: string`（逗号分隔 XXXXX.HK） | JSON 字符串（`Quote[]`） |
 | `stock-get-indices` | renderer → main | — | JSON 字符串（`IndexQuote[]`） |
 | `show-notification` | renderer → main | `title: string, body: string` | void |
+| `stock-get-preset-data` | renderer → main | `market: 'cn' \| 'hk' \| 'us'` | JSON 字符串（预置股票列表） |
 
 **settings 命名空间**：`settings-get/set` 在 electron-store 中以 `settings.{key}` 存储，与 `watchlist` 隔离。当前使用的 key：
 - `settings.finnhubApiKey` — Finnhub API Key（用户在 Settings 页面配置）
+- `settings.tushareToken` — Tushare Pro Token（可选，A 股数据优先使用）
+- `settings.cnProviderPriority` — A 股 Provider 优先级（默认 `['tushare', 'akshare']`）
+- `settings.hkProviderPriority` — 港股 Provider 优先级（默认 `['akshare_hk']`）
+- `settings.usProviderPriority` — 美股 Provider 优先级（默认 `['finnhub', 'yfinance']`）
+
+**辅助函数**：
+- `getPythonScriptPath()` — 根据 `app.isPackaged` 返回 Python 脚本路径（开发模式 `../scripts/main.py`，打包后 `process.resourcesPath`）
+- `runPythonScript(args, timeoutMs, resolve)` — 通用 Python 脚本执行（带 try-catch 防止 `execFile` 同步抛出异常）
+- `buildTokenArgs()` — 构建 Token 参数列表（仅在 Token 非空时追加 `--tushare-token`/`--finnhub-key`）
+- `getCnProviders()` / `getHkProviders()` / `getUsProviders()` — 从 electron-store 读取各市场 Provider 优先级
 
 **不负责**：任何业务逻辑、数据处理、UI 渲染。
 
@@ -228,6 +230,7 @@ export const darkTheme: ThemeConfig = {
 - `window.electronAPI.getHKQuote(symbols)` — 港股实时行情（AKShare stock_hk_spot，10min 缓存）
 - `window.electronAPI.getIndices()` — 关键指数行情（上证/科创/纳斯达克/标普/恒生/恒生科技）
 - `window.electronAPI.showNotification(title, body)` — 系统通知（股价阈值提醒）
+- `window.electronAPI.getPresetStockData(market)` — 预置股票数据（本地 JSON 文件，用于快速搜索）
 
 **不负责**：业务逻辑，只做透传。新增 IPC 通道时，必须同时修改 `main.ts`（注册 handler）和 `preload.ts`（暴露方法）。
 
@@ -236,7 +239,7 @@ export const darkTheme: ThemeConfig = {
 **职责**：封装所有 Finnhub API 调用，实现请求限流队列，提供统一错误处理。
 
 **API Key 读取机制**：
-- `getFinnhubApiKey()` — 优先从 `electron-store` 的 `settings.finnhubApiKey` 读取用户配置的 Key，降级到 `.env` 的 `VITE_STOCK_API_KEY`
+- `getFinnhubApiKey()` — 从 `electron-store` 的 `settings.finnhubApiKey` 读取用户配置的 Key
 - `requireApiKey()` — 在 Key 为空时抛出友好错误 `"Finnhub API Key not configured. Please go to Settings to add your key."`
 - **不再在模块顶层读取 `API_KEY`**，每次调用时动态获取，支持用户在 Settings 页面配置后立即生效
 
@@ -253,7 +256,7 @@ export const darkTheme: ThemeConfig = {
 
 ### `src/store/useStockStore.ts` — 全局状态
 
-**职责**：管理自选股列表（`watchlist`）、实时报价缓存（`quotes`）、关键指数（`indices`），负责与 `electron-store` 的读写同步。
+**职责**：管理自选股列表（`watchlist`）、实时报价缓存（`quotes`）、关键指数（`indices`）、AI 对话历史（`conversations`）、用户资料（`userProfile`），负责与 `electron-store` 的读写同步。
 
 **状态字段**：
 | 字段 | 类型 | 说明 |
@@ -261,7 +264,7 @@ export const darkTheme: ThemeConfig = {
 | `watchlist` | `string[]` | 自选股代码列表（大写） |
 | `quotes` | `Record<string, Quote>` | symbol → 最新报价的映射 |
 | `symbolNames` | `Record<string, string>` | symbol → 中文名称的映射（持久化） |
-| `indices` | `IndexQuote[]` | 关键指数行情列表（6 个预设指数） |
+| `indices` | `IndexQuote[]` | 关键指数行情列表（8 个预设指数） |
 | `loading` | `boolean` | 全局加载状态 |
 | `error` | `string \| null` | 全局错误信息 |
 | `rateLimited` | `boolean` | API 限流标志 |
@@ -269,10 +272,17 @@ export const darkTheme: ThemeConfig = {
 | `refreshInterval` | `number` | 自动刷新间隔（秒，默认 300） |
 | `alertThresholds` | `Record<string, AlertThreshold>` | symbol → 价格/涨幅提醒阈值 |
 | `visibleColumns` | `ColumnKey[]` | 自选股列表可见列配置 |
+| `conversations` | `Conversation[]` | AI 对话历史列表（按 updatedAt 倒序） |
+| `activeConversationId` | `string \| null` | 当前激活的对话 ID |
+| `userProfile` | `UserProfile` | 用户个人资料（头像 + 用户名） |
 
 **关键 action**：
 - `fetchIndices()` — 调用 `window.electronAPI.getIndices()` 获取指数行情，解析 JSON 后更新 `indices`
 - `loadWatchlist()` / `saveWatchlist()` — 从 electron-store 读写自选股列表
+- `updateWatchlistOrder(newOrder)` — 更新自选股顺序（拖拽排序后调用）
+- `loadQuotesCache()` / `saveQuotesCache()` — 报价缓存快照（冷启动时先展示当天缓存）
+- `loadConversations()` / `createConversation()` / `appendMessage()` / `deleteConversation()` — AI 对话 CRUD
+- `loadUserProfile()` / `saveUserProfile()` — 用户资料读写（随机 emoji 头像 + 用户名）
 
 **不负责**：新闻数据（由 `useStockNews` hook 管理）、技术分析数据（组件本地状态）。
 
@@ -290,7 +300,7 @@ export const darkTheme: ThemeConfig = {
 
 ### `src/pages/Dashboard.tsx` — 自选股看板
 
-**职责**：展示自选股列表、搜索添加股票、批量刷新报价（定时 + 手动触发）、展示 6 个关键指数卡片。
+**职责**：展示自选股列表、搜索添加股票、批量刷新报价（定时 + 手动触发）、展示 8 个关键指数卡片。
 
 **关键行为**：
 - 组件挂载时依次调用 `loadWatchlist()`、`loadSymbolNames()`、`loadColorMode()`、`loadRefreshInterval()`、`loadAlertThresholds()`、`loadVisibleColumns()` 从 electron-store 加载数据
@@ -300,18 +310,21 @@ export const darkTheme: ThemeConfig = {
 - 接受 `onNavigateToSettings?: () => void` prop，用于从搜索提示跳转到 Settings tab
 
 **指数卡片区域**：
-- 始终渲染 6 个预设指数卡片（`PRESET_INDICES` 数组），数据未到时用 `—` 占位
-- 展示顺序（固定）：上证指数 → 纳斯达克 → 恒生科技 → 科创综指 → 恒生指数 → 标普500
+- 始终渲染 8 个预设指数卡片（`PRESET_INDICES` 数组），数据未到时用 `—` 占位
+- 展示顺序（固定）：上证指数 → 深证成指 → 创业板指 → 纳斯达克 → 标普500 → 道琼斯 → 恒生指数 → 恒生科技
 - 数据来源：`useStockStore` 的 `indices` 字段，通过 `fetchIndices()` 更新
+- secid 映射详见 `src/services/eastmoney.ts` 的 `INDEX_SECID_MAP`，**注意恒生指数 HSI 走市场代码 `100`，而恒生科技 HSTECH 走港股专属市场代码 `124`**，两者不一致，必须分别配置
 
 ```typescript
 const PRESET_INDICES = [
   { symbol: '000001.SH', name: '上证指数' },
+  { symbol: '399001.SZ', name: '深证成指' },
+  { symbol: '399006.SZ', name: '创业板指' },
   { symbol: '.IXIC',     name: '纳斯达克' },
-  { symbol: 'HSTECH',    name: '恒生科技' },
-  { symbol: '000688.SH', name: '科创综指' },
-  { symbol: 'HSI',       name: '恒生指数' },
   { symbol: '.INX',      name: '标普500'  },
+  { symbol: '.DJI',      name: '道琼斯'   },
+  { symbol: 'HSI',       name: '恒生指数' },
+  { symbol: 'HSTECH',    name: '恒生科技' },
 ];
 ```
 
@@ -324,24 +337,42 @@ const PRESET_INDICES = [
 **职责**：展示单只股票的详情（公司信息 + 实时报价）、新闻列表、真实技术分析（RSI/SMA）。
 
 **关键行为**：
-- 技术分析通过 `getHistoricalData()` 获取真实 K 线数据，计算 RSI(14)/SMA20/50/200，在 Modal 中展示
-- 数据来源标注：`[AKShare]`、`[yfinance]`、`[SIMULATED DATA]`（网络不通时降级为随机模拟）
+- 技术分析通过 `fetchKLineData()`（东方财富 K 线接口，渲染进程直接 fetch）获取真实 K 线数据，计算 RSI(14)/SMA20/50/200，在 Modal 中展示
+- 数据来源标注：`[EastMoney]`（真实数据）、`[SIMULATED DATA]`（数据不足时降级为随机模拟）
 - 报价通过 `useStockQuote` hook 每 10s 自动刷新
 - 公司 profile 仅在组件挂载时请求一次
 - 接收 `initialSymbol` prop（由 App.tsx 传入），不再使用 `useParams`
 
+### `src/pages/Chat.tsx` — AI 对话页
+
+**职责**：提供基于股票上下文的 AI 对话分析功能，支持多轮对话、历史记录管理。
+
+**关键行为**：
+- 接收 `activeConversationId` 和 `initialSymbol` props（由 App.tsx 管理）
+- 对话消息通过 `useStockStore` 的 `appendMessage()` 持久化到 electron-store
+- 用户消息气泡（右侧）和 AI 消息气泡（左侧）分别渲染，AI 消息支持 Markdown 渲染（`react-markdown`）
+- 关联股票时在顶部展示 StockInfoBar（实时报价，通过 `useStockQuote` hook 刷新）
+- 用户资料（头像 + 用户名）从 `useStockStore.userProfile` 读取
+
 ### `src/pages/Settings.tsx` — 设置页
 
-**职责**：用户偏好配置，包含数据源配置和涨跌色风格设置。
+**职责**：用户偏好配置，包含数据源配置、Provider 优先级、涨跌色风格、刷新间隔、列配置等。
 
 **数据源配置 Card（DataSourceCard 组件）**：
 - **AKShare**：免费无需配置，显示 Ready 状态
 - **yfinance**：免费无需配置，显示 Ready 状态
 - **Finnhub**：需要用户输入 API Key，通过 `window.electronAPI.setSettings('finnhubApiKey', key)` 存储到 electron-store
-- Key 保存后立即生效（`stockApi.ts` 每次调用时动态读取）
+- **Tushare**：可选，输入 Token 后存储到 `settings.tushareToken`
+- Key/Token 保存后立即生效（`stockApi.ts` 和 `main.ts` 每次调用时动态读取）
 - 提供 Save / Clear 操作，Key 已配置时显示 Configured 状态
 
+**Provider 优先级配置**：A 股/港股/美股各市场的数据源优先级可调整，存储到 `settings.*ProviderPriority`。
+
 **涨跌色风格 Card**：中国风格（红涨绿跌）/ 美股风格（绿涨红跌），存储在 Zustand store 的 `colorMode` 字段。
+
+**刷新间隔配置**：10s / 1min / 5min / 10min / 30min，默认 5 分钟。
+
+**列配置**：用户可自定义自选股列表显示哪些列。
 
 ### `src/theme/config.ts` — Ant Design 主题配置
 
@@ -358,7 +389,7 @@ const PRESET_INDICES = [
 
 **导出函数**：`formatPrice`（USD 货币）、`formatPercent`（带符号百分比）、`formatMarketCap`（T/B/M/K 单位）、`formatDate`（本地化日期时间）
 
-**⚠️ 已知 Bug**：`formatMarketCap` 函数将传入值直接按美元做 T/B/M/K 换算，但 Finnhub `getProfile()` 返回的 `marketCapitalization` 单位是**百万美元**。因此当前展示的市值数字偏小 100 万倍（如实际市值 3 万亿美元的公司，显示为 `$3.00M` 而非 `$3.00T`）。详见 `docs/known-issues/market-cap-unit-mismatch.md`。
+**注意**：`formatMarketCap` 接受百万美元单位的输入（与 Finnhub `getProfile()` 返回的 `marketCapitalization` 单位一致），内部乘以 `1_000_000` 后再做 T/B/M/K 换算。此 Bug 已修复。
 
 ### `src/components/KLineChart.tsx` — K 线图组件
 
@@ -398,16 +429,19 @@ tickMarkFormatter: (time: number) => {
 详见 `src/types/index.ts`，核心类型速查：
 
 ```typescript
-Quote             // 实时报价：symbol, price, change, changePercent, volume?, high?, low?, open?, previousClose?, timestamp
-Stock             // 股票基本信息：symbol, name, price, change, changePercent, marketCap?, description?
-NewsItem          // 新闻条目：title, source, publishedAt, url, summary?
-AnalysisResult    // 技术分析：symbol, rsi?, sma20?, sma50?, sma200?, recommendation, summary
-SearchResult      // 搜索结果：symbol, description, displaySymbol, type
-StockProfile      // Finnhub 公司档案（API 原始格式）：name, exchange, marketCapitalization, country, industry...
+Quote                // 实时报价：symbol, price, change, changePercent, volume?, high?, low?, open?, previousClose?, timestamp
+Stock                // 股票基本信息：symbol, name, price, change, changePercent, marketCap?, peRatio?, high52Week?, low52Week?, description?
+NewsItem             // 新闻条目：title, source, publishedAt, url, summary?
+AnalysisResult       // 技术分析：symbol, rsi?, sma20?, sma50?, sma200?, recommendation, summary
+SearchResult         // 搜索结果：symbol, description, displaySymbol, type
+StockProfile         // Finnhub 公司档案（API 原始格式）：name, exchange, marketCapitalization, country, industry...
 HistoricalDataPoint  // K 线数据点：date, open, high, low, close, volume
 HistoricalDataResult // K 线结果：data, source('akshare'|'yfinance'|'simulated'), error?
-IndexQuote        // 关键指数行情：symbol, name, price, change, changePercent
-StockQuestion     // 用户问题记录：id, symbol, question, createdAt
+IndexQuote           // 关键指数行情：symbol, name, price, change, changePercent
+ConversationMessage  // 对话消息：id, role('user'|'assistant'), content, createdAt
+Conversation         // 对话记录：id, title, symbol?, messages, createdAt, updatedAt
+UserProfile          // 用户资料：username, avatar?, emojiAvatar
+StockQuestion        // @deprecated，使用 Conversation + ConversationMessage 替代
 ```
 
 **类型扩展规则**：
@@ -455,21 +489,33 @@ axios → Finnhub API (https://finnhub.io/api/v1)
 ─────────────────────────────────────────
 
 Dashboard 初始化 / 定时刷新（与 fetchAllQuotes 同一 interval）
-  │  fetchIndices()
+  │  fetchIndices() / fetchAllQuotes()
   ▼
-window.electronAPI.getIndices()  ←── preload.ts contextBridge
+window.electronAPI.getIndices() / getCNQuote()  ←── preload.ts contextBridge
   │
   ▼
-IPC: stock-get-indices  ──→  main.ts → execFile(python3, main.py --action get_indices)
+IPC: stock-get-indices / stock-get-cn-quote  ──→  main.ts
   │
   ▼
-scripts/main.py handle_get_indices()
-  ├── A 股指数（上证/科创）：ak.stock_zh_index_daily() 取最近两日计算涨跌
-  ├── 港股指数（恒生/恒生科技）：ak.stock_hk_index_spot_sina()
-  └── 美股指数（纳斯达克/标普）：ak.index_us_stock_sina() 取最近两日计算涨跌
+src/services/eastmoney.ts（Node.js fetch，毫秒级，无需 Python）
+  ├── fetchIndices()：一次请求获取 8 个关键指数（上证/深成/创业板/纳斯达克/标普/道琼斯/恒生/恒生科技）
+  └── fetchCNQuotes()：批量获取 A 股个股实时行情
+  │  ⚠️ ut token 自动轮换：rc !== 0 时切换到下一个备用值重试（最多 3 次）
+  │  ⚠️ 超时 8s 后抛出异常，触发降级到 Python Provider 链
+  ▼
+返回 JSON 字符串 → store.indices / store.quotes → Dashboard 指数卡片 / 个股行情渲染
+
+─────────────────────────────────────────
+
+降级链（东方财富失败时）
+  │
+  ▼
+IPC → main.ts → execFile(python3, main.py)
+  ├── 指数（--action get_indices）：AKShare stock_zh_index_daily / stock_hk_index_spot_sina / index_us_stock_sina
+  └── A 股行情（--action cn_quote）：Tushare Pro（有 Token）→ AKShare stock_zh_a_hist_tx（腾讯财经）
   │  ⚠️ 调用 AKShare 前将 sys.stdout 重定向到 sys.stderr，防止 tqdm 污染 JSON 输出
   ▼
-返回 JSON 字符串（IndexQuote[]）→ store.indices → Dashboard 指数卡片渲染
+返回 JSON 字符串（降级数据）→ 渲染
 ```
 
 ---
@@ -691,7 +737,9 @@ scripts/main.py handle_get_indices()
 
 ### 模式 C：新增页面
 
-**适用场景**：新增独立的路由页面（如投资组合页、设置页）。
+**适用场景**：新增独立的 Tab 页面（如投资组合页）。
+
+**注意**：App.tsx 使用 Tab 导航（`NavTab` 类型 + `NAV_ITEMS` 数组），**不使用 React Router**。页面切换通过 `activeTab` 状态控制条件渲染。
 
 **步骤**：
 
@@ -700,21 +748,14 @@ scripts/main.py handle_get_indices()
    - 本地状态用 `useState`，副作用用 `useEffect`
    - 错误和加载状态必须有 UI 反馈（参考 Dashboard 的 Alert 组件）
 
-2. **注册路由**（`src/App.tsx`）
-   ```typescript
-   <Route path="/your-path" element={<YourPage />} />
-   ```
-   同时在 `AppHeader` 中按需添加导航链接。
+2. **注册 Tab**（`src/App.tsx`）
+   - 在 `NavTab` 类型中新增 key：`type NavTab = 'dashboard' | 'detail' | 'chat' | 'settings' | 'yourPage';`
+   - 在 `NAV_ITEMS` 数组中新增导航项：`{ key: 'yourPage', icon: <XxxOutlined />, label: '页面名' }`
+   - 在主内容区的条件渲染中新增分支：`{activeTab === 'yourPage' && <YourPage />}`
 
 3. **更新导入**（`src/App.tsx`）
    ```typescript
    import YourPage from '@/pages/YourPage';
-   ```
-
-4. **如需导航到新页面**，在其他组件中：
-   ```typescript
-   const navigate = useNavigate();
-   navigate('/your-path');
    ```
 
 **验证**：`npx tsc --noEmit` 无类型错误
@@ -772,7 +813,7 @@ grep "electronAPI" src/types/electron.d.ts
 - [ ] 新增的 Hook 是否在组件卸载时清理了 interval / 取消了异步操作？
 - [ ] 调用 AKShare 的 Python 函数，是否在调用前将 `sys.stdout` 重定向到 `sys.stderr`（防止 tqdm 污染 JSON 输出）？
 - [ ] 使用 lightweight-charts v5 的时间格式化回调（`tickMarkFormatter`、`localization.timeFormatter`）时，是否按 `BusinessDay` 对象 `{ year, month, day }` 解构，而非当作数字或字符串处理？
-- [ ] Dashboard 的指数卡片顺序是否与 `PRESET_INDICES` 数组一致（上证→纳斯达克→恒生科技→科创→恒生→标普）？
+- [ ] Dashboard 的指数卡片顺序是否与 `PRESET_INDICES` 数组一致（上证→深成→创业板→纳斯达克→标普→道琼斯→恒生→恒生科技）？
 
 ---
 

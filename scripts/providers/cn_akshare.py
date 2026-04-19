@@ -2,15 +2,22 @@
 CnAKShareProvider — A股 AKShare 数据提供器
 
 数据源：AKShare（免费，无需 Token）
-  - 实时行情：stock_zh_a_hist()（东方财富，取最近一天）
+  - 实时行情：stock_zh_a_spot()（新浪财经，3min 缓存，返回当前实时价格）
+             降级：stock_zh_a_hist_tx()（腾讯财经日线，取最近一天收盘价）
   - 搜索：stock_info_a_code_name()（股票列表，5min 缓存）
   - 历史 K 线：stock_zh_a_hist()（东方财富）
 
 重试策略：指数退避，最多 3 次（参考 TradingAgents-CN AKShareProvider）
-缓存策略：股票列表 5min 进程级缓存
+缓存策略：
+  - 实时行情全量快照：3 分钟进程级缓存（避免每次都拉全量数据）
+  - 股票列表：5 分钟进程级缓存
+
+⚠️ 重要：stock_zh_a_hist_tx 是历史日线接口，盘中取到的是昨天收盘价，不是实时价格。
+   实时行情必须使用 stock_zh_a_spot（新浪财经），该接口返回当前实时价格和时间戳。
 """
 import sys
 import time
+import threading
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -20,6 +27,13 @@ from .base import BaseStockProvider, QuoteData, HistoricalBar, SearchResult
 _stock_list_cache: list[dict] = []
 _stock_list_cache_time: float = 0.0
 _STOCK_LIST_CACHE_TTL: float = 300.0  # 5 分钟
+
+# A 股实时行情全量快照缓存（stock_zh_a_spot，3 分钟 TTL）
+# key: 代码（带市场前缀，如 sh600519 / sz000001）→ dict（行情字段）
+_cn_spot_cache: dict[str, dict] = {}
+_cn_spot_cache_time: float = 0.0
+_CN_SPOT_CACHE_TTL: float = 180.0  # 3 分钟
+_cn_spot_lock = threading.Lock()
 
 
 class CnAKShareProvider(BaseStockProvider):
@@ -81,21 +95,94 @@ class CnAKShareProvider(BaseStockProvider):
         # 默认尝试深交所
         return f"sz{symbol}"
 
-    # ── 单只 A 股实时行情（带重试）────────────────────────────────────────────
+    # ── A 股全量实时行情快照（stock_zh_a_spot，3min 缓存）────────────────────
+
+    def _load_cn_spot(self) -> dict[str, dict]:
+        """
+        获取 A 股全量实时行情快照（新浪财经）。
+        返回 dict，key 为带市场前缀的代码（如 sh600519 / sz000001），value 为行情字段。
+        3 分钟进程级缓存 + threading.Lock 防并发重复拉取。
+
+        ⚠️ 重要：stock_zh_a_spot 返回的是当前实时价格（含时间戳字段），
+           不同于 stock_zh_a_hist_tx（历史日线，盘中取到的是昨天收盘价）。
+        """
+        global _cn_spot_cache, _cn_spot_cache_time
+
+        now = time.time()
+        if _cn_spot_cache and (now - _cn_spot_cache_time) < _CN_SPOT_CACHE_TTL:
+            return _cn_spot_cache
+
+        acquired = _cn_spot_lock.acquire(timeout=30)
+        if not acquired:
+            print("[AKShare] A股实时行情缓存锁等待超时，使用旧缓存", file=sys.stderr)
+            return _cn_spot_cache
+
+        try:
+            now = time.time()
+            if _cn_spot_cache and (now - _cn_spot_cache_time) < _CN_SPOT_CACHE_TTL:
+                return _cn_spot_cache
+
+            import akshare as ak
+            df = ak.stock_zh_a_spot()
+            if df is None or df.empty:
+                return _cn_spot_cache
+
+            result: dict[str, dict] = {}
+            for _, row in df.iterrows():
+                code = str(row["代码"])  # 格式如 sh600519 / sz000001
+                prev_close = self.safe_float(row.get("昨收"))
+                price = self.safe_float(row.get("最新价"))
+                change = self.safe_float(row.get("涨跌额"))
+                change_percent = self.safe_float(row.get("涨跌幅"))
+                result[code] = {
+                    "price": price,
+                    "change": change,
+                    "change_percent": change_percent,
+                    "open": self.safe_float(row.get("今开")),
+                    "high": self.safe_float(row.get("最高")),
+                    "low": self.safe_float(row.get("最低")),
+                    "previous_close": prev_close,
+                    "volume": self.safe_float(row.get("成交量", 0)),
+                }
+
+            _cn_spot_cache = result
+            _cn_spot_cache_time = time.time()
+            print(f"[AKShare] A股实时行情快照已更新，共 {len(result)} 只", file=sys.stderr)
+            return result
+        except Exception as err:
+            print(f"[AKShare] A股实时行情快照获取失败（stock_zh_a_spot）: {err}", file=sys.stderr)
+            return _cn_spot_cache
+        finally:
+            _cn_spot_lock.release()
+
+    # ── 单只 A 股实时行情 ────────────────────────────────────────────────────
 
     def _fetch_single_quote(self, symbol: str) -> Optional[dict]:
         """
-        通过 stock_zh_a_hist_tx（腾讯财经）取最近几天数据作为实时行情。
-        腾讯财经接口比东方财富（stock_zh_a_hist）更稳定，网络可达性更好。
+        获取单只 A 股实时行情。
+        主数据源：stock_zh_a_spot（新浪财经全量实时行情，3min 缓存）
+        降级：stock_zh_a_hist_tx（腾讯财经历史日线，取最近一天收盘价）
 
-        返回字段：date, open, close, high, low, amount（无 volume，无涨跌额）
-        涨跌额和涨跌幅通过最近两日收盘价计算。
+        ⚠️ 注意：stock_zh_a_hist_tx 是历史日线接口，盘中取到的是昨天收盘价，
+           不是实时价格，仅作为 stock_zh_a_spot 不可用时的降级方案。
         """
+        tx_symbol = self._add_market_prefix(symbol)
+
+        # 主路径：从全量实时行情快照中查找
+        try:
+            spot_map = self._load_cn_spot()
+            if spot_map and tx_symbol in spot_map:
+                return spot_map[tx_symbol]
+        except Exception as err:
+            print(f"[AKShare] A股 {symbol} 实时行情查找失败: {err}", file=sys.stderr)
+
+        # 降级路径：stock_zh_a_hist_tx（腾讯财经历史日线）
+        # ⚠️ 此接口返回的是历史收盘价，盘中数据为昨天收盘价，非实时
+        print(f"[AKShare] A股 {symbol} 降级到 stock_zh_a_hist_tx（历史日线）", file=sys.stderr)
         import akshare as ak
 
         today = datetime.now().strftime("%Y%m%d")
         start = (datetime.now() - timedelta(days=10)).strftime("%Y%m%d")
-        tx_symbol = self._add_market_prefix(symbol)
 
         try:
             df = ak.stock_zh_a_hist_tx(
@@ -120,11 +207,10 @@ class CnAKShareProvider(BaseStockProvider):
                 "high": self.safe_float(latest["high"]),
                 "low": self.safe_float(latest["low"]),
                 "previous_close": prev_close,
-                # stock_zh_a_hist_tx 无成交量字段，返回 0
                 "volume": 0,
             }
         except Exception as err:
-            print(f"[AKShare] A股 {symbol} 获取失败（腾讯财经）: {err}", file=sys.stderr)
+            print(f"[AKShare] A股 {symbol} 获取失败（腾讯财经降级）: {err}", file=sys.stderr)
             return None
 
     # ── BaseStockProvider 接口实现 ────────────────────────────────────────────

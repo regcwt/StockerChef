@@ -7,7 +7,7 @@ StockerChef 数据获取统一入口
 
 Provider 优先级由调用方通过 --cn-providers / --hk-providers / --us-providers 参数控制，
 默认值与 Settings.tsx 中的 DEFAULT_*_PROVIDERS 保持一致：
-  A 股：tushare,akshare
+  A 股：eastmoney,tushare,akshare
   港股：akshare_hk
   美股：finnhub,yfinance
 
@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from providers import (
     CnAKShareProvider,
+    CnEastMoneyProvider,
     CnTushareProvider,
     HkAKShareProvider,
     UsYFinanceProvider,
@@ -94,6 +95,8 @@ def _make_cn_provider(provider_id: str, tushare_token: str | None):
             return None
         p = CnTushareProvider(token=tushare_token)
         return p if p.is_available() else None
+    if provider_id == 'eastmoney':
+        return CnEastMoneyProvider()
     if provider_id == 'akshare':
         return CnAKShareProvider()
     return None
@@ -256,13 +259,29 @@ def handle_us_quote(symbols: list[str], us_providers: list[str]) -> list[dict]:
 def handle_get_indices() -> list[dict]:
     """
     获取关键指数行情：
-      - A 股指数（上证、科创综指）→ AKShare stock_zh_index_daily
-      - 港股指数（恒生、恒生科技）→ AKShare stock_hk_index_spot_sina
-      - 美股指数（纳斯达克、标普）→ AKShare index_us_stock_sina（取最近两日对比）
+      - 优先：东方财富 push2 HTTP API（批量一次请求，速度极快）
+      - 降级：AKShare（东方财富不可用时）
+        - A 股指数（上证、科创综指）→ AKShare stock_zh_index_daily
+        - 港股指数（恒生、恒生科技）→ AKShare stock_hk_index_spot_sina
+        - 美股指数（纳斯达克、标普）→ AKShare index_us_stock_sina（取最近两日对比）
     
     注意：AKShare 内部使用 tqdm 进度条，默认输出到 stdout，会污染 JSON 输出。
     通过临时将 sys.stdout 重定向到 sys.stderr，确保 stdout 只有纯 JSON。
     """
+    # ── 优先：东方财富 push2 接口（批量实时，速度极快）─────────────────────
+    try:
+        em_provider = CnEastMoneyProvider()
+        em_results = em_provider.get_indices()
+        if em_results:
+            print(f"[INDICES] 东方财富返回 {len(em_results)} 个指数", file=sys.stderr)
+            return em_results
+        else:
+            print("[INDICES] 东方财富返回空结果，降级到 AKShare", file=sys.stderr)
+    except Exception as em_err:
+        print(f"[INDICES] 东方财富获取失败: {em_err}，降级到 AKShare", file=sys.stderr)
+
+    # ── 降级：AKShare ─────────────────────────────────────────────────────────
+    print("[INDICES] 使用 AKShare 获取指数数据", file=sys.stderr)
     import akshare as ak
     import sys
 
@@ -481,7 +500,7 @@ def parse_providers(raw: str | None, default: list[str]) -> list[str]:
     providers = [p.strip() for p in raw.split(",") if p.strip()]
     return providers if providers else default
 
-DEFAULT_CN = ['tushare', 'akshare']
+DEFAULT_CN = ['eastmoney', 'tushare', 'akshare']
 DEFAULT_HK = ['akshare_hk']
 DEFAULT_US = ['finnhub', 'yfinance']
 

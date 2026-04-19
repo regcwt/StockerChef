@@ -5,8 +5,7 @@ const BASE_URL = 'https://finnhub.io/api/v1';
 
 /**
  * 获取 Finnhub API Key
- * 优先从 electron-store 用户设置读取（Settings 页面配置）
- * 降级到 .env 环境变量（开发时兼容）
+ * 从 electron-store 用户设置读取（Settings 页面配置）
  */
 const getFinnhubApiKey = async (): Promise<string> => {
   try {
@@ -17,8 +16,7 @@ const getFinnhubApiKey = async (): Promise<string> => {
   } catch {
     // electron-store 不可用时（如纯 Web 环境）忽略错误
   }
-  // 降级到环境变量
-  return import.meta.env.VITE_STOCK_API_KEY || '';
+  return '';
 };
 
 // Rate limiting configuration

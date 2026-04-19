@@ -9,10 +9,14 @@ A macOS desktop stock dashboard application built with Electron + React + Vite +
 
 ## Features
 
-- 📊 **Real-time Stock Quotes** - Monitor your favorite stocks with auto-refreshing prices
-- 📈 **Technical Analysis** - View simulated RSI, SMA indicators and buy/sell recommendations
+- 📊 **Real-time Stock Quotes** - Monitor A-shares, HK stocks, and US stocks with configurable auto-refresh (10s ~ 30min)
+- 📈 **Technical Analysis** - RSI, SMA indicators calculated from real K-line data (AKShare/yfinance)
+- 📉 **K-line Charts** - Professional candlestick charts powered by lightweight-charts v5
+- 💬 **AI Chat Analysis** - Multi-turn conversation with AI for stock analysis (Markdown rendering)
 - 📰 **Stock News** - Stay updated with the latest news for each stock
-- 💾 **Local Persistence** - Your watchlist is saved automatically using electron-store
+- 🔔 **Price Alerts** - System notifications when price/change thresholds are triggered
+- 🔀 **Drag & Drop Sorting** - Reorder your watchlist with drag and drop (@dnd-kit)
+- 💾 **Local Persistence** - Watchlist, conversations, and settings saved automatically
 - 🌓 **Dark/Light Mode** - Automatically follows your system theme preference
 - ⚡ **Rate Limiting** - Smart request queue to respect API limits
 - 🎨 **Modern UI** - Beautiful interface powered by Ant Design 5.x
@@ -118,19 +122,22 @@ npm run preview
 StockerChef/
 ├── src/                     # All source code
 │   ├── electron/            # Electron main process files
-│   │   ├── main.ts          # Main Electron process
-│   │   └── preload.ts       # Preload script for IPC
+│   │   ├── main.ts          # Main Electron process (IPC, Python scripts)
+│   │   └── preload.ts       # Preload script for IPC bridge
 │   ├── components/          # Reusable UI components
+│   │   └── KLineChart.tsx   # K-line chart (lightweight-charts v5)
 │   ├── hooks/               # Custom React hooks
 │   │   ├── useStockQuote.ts # Stock quote polling hook
 │   │   └── useStockNews.ts  # Stock news fetching hook
 │   ├── pages/               # Page components
 │   │   ├── Dashboard.tsx    # Main watchlist dashboard
-│   │   └── Analysis.tsx     # Stock analysis page
+│   │   ├── Analysis.tsx     # Stock analysis page
+│   │   ├── Chat.tsx         # AI chat analysis page
+│   │   └── Settings.tsx     # Settings page
 │   ├── services/            # API service layer
-│   │   └── stockApi.ts      # Finnhub API integration
+│   │   └── stockApi.ts      # Finnhub API integration + rate limiting
 │   ├── store/               # Zustand state management
-│   │   └── useStockStore.ts # Global stock state
+│   │   └── useStockStore.ts # Global stock state + conversations
 │   ├── styles/              # Global styles
 │   │   └── global.css       # CSS utilities
 │   ├── theme/               # Ant Design theme config
@@ -140,16 +147,26 @@ StockerChef/
 │   │   └── electron.d.ts    # Electron API types
 │   ├── utils/               # Utility functions
 │   │   └── format.ts        # Formatting helpers
-│   ├── App.tsx              # Main App component
+│   ├── App.tsx              # Main App component (Tab navigation)
 │   ├── main.tsx             # React entry point
 │   └── vite-env.d.ts        # Vite environment types
+├── scripts/                 # Python data fetching scripts
+│   ├── main.py              # Unified entry point
+│   └── providers/           # Multi-provider architecture
+│       ├── cn_akshare.py    # A-shares (AKShare)
+│       ├── cn_tushare.py    # A-shares (Tushare)
+│       ├── hk_akshare.py    # HK stocks (AKShare)
+│       └── us_yfinance.py   # US stocks (yfinance)
+├── data/                    # Preset stock data (JSON)
+│   ├── stocks-hk.json       # HK stock list
+│   └── stocks-us.json       # US stock list
 ├── resources/               # Application resources
-│   └── icon.png             # Application icon (512x512 recommended)
+│   └── icon.icns            # macOS application icon
 ├── index.html               # HTML template
 ├── package.json             # Project dependencies
+├── requirements.txt         # Python dependencies
 ├── tsconfig.json            # TypeScript configuration
 ├── vite.config.ts           # Vite configuration
-├── .env.example             # Environment variables template
 └── README.md                # This file
 ```
 
@@ -256,10 +273,10 @@ To replace the icon, simply replace `resources/icon.png` with your own icon file
 
 ### Changing the Update Interval
 
-Edit `src/pages/Dashboard.tsx` and modify the interval in this line:
+The refresh interval is configurable in the Settings page (10s / 1min / 5min / 10min / 30min, default 5 minutes). To change the default value, edit `src/store/useStockStore.ts`:
 
 ```typescript
-const interval = setInterval(fetchAllQuotes, 10000); // 10 seconds
+refreshInterval: 300, // default 300 seconds (5 minutes)
 ```
 
 ### Adjusting Rate Limits
@@ -274,10 +291,9 @@ const MAX_REQUESTS_PER_MINUTE = 30; // Change this value
 
 - [ ] WebSocket support for real-time updates
 - [ ] Portfolio tracking
-- [ ] Price alerts with system notifications
 - [ ] Multiple watchlists
 - [ ] Export data to CSV
-- [ ] Real-time technical indicators (currently calculated on-demand)
+- [ ] More technical indicators (MACD, BOLL, etc.)
 - [ ] More data source providers
 
 ## License
@@ -295,4 +311,4 @@ MIT License - feel free to use this project for personal or commercial purposes.
 
 ---
 
-**Note**: This is a demonstration application. The technical analysis features use simulated data. For production use, implement proper historical data fetching and real indicator calculations.
+**Note**: Technical analysis is calculated from real K-line data (AKShare/yfinance). When the network is unavailable, it falls back to simulated data with clear UI labels (`[AKShare]` / `[yfinance]` / `[SIMULATED DATA]`).

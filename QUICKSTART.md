@@ -38,8 +38,6 @@ StockerChef/
 ├── package.json                # Dependencies
 ├── tsconfig.json               # TypeScript config
 ├── vite.config.ts              # Vite + Electron config
-├── .env                        # Your API key (already created with demo key)
-├── .env.example                # Template for API key
 └── README.md                   # Full documentation
 ```
 
@@ -70,16 +68,12 @@ python3 -m pip install -r requirements.txt
 - `tushare` - A-share data (optional, requires token)
 - `yfinance` - US stock historical data
 
-### 2. Get Your Finnhub API Key
+### 2. Get Your Finnhub API Key (Optional)
 
 1. Visit: https://finnhub.io/register
 2. Sign up for free
 3. Copy your API key from the dashboard
-4. Update `.env` file with your real API key:
-
-```env
-VITE_STOCK_API_KEY=your_actual_api_key_here
-```
+4. After launching the app, go to **Settings → Data Sources** and enter your key there
 
 ### 3. Start the Application
 
@@ -131,12 +125,11 @@ The Electron app will launch automatically!
 - **package.json**: All dependencies and scripts
 - **tsconfig.json**: TypeScript configuration
 - **vite.config.ts**: Vite + Electron integration
-- **.env**: Environment variables (currently set to "demo" key)
 - **.gitignore**: Proper exclusions
 
 ## 📝 Important Notes
 
-1. **API Key**: The `.env` file currently has `VITE_STOCK_API_KEY=demo`. Replace this with your real Finnhub API key for actual data.
+1. **API Key**: Go to **Settings → Data Sources** in the app to enter your Finnhub API key. The key is saved locally and takes effect immediately.
 
 2. **Rate Limiting**: The app limits to 30 API calls/minute (50% of Finnhub's free tier limit) to prevent hitting limits.
 
@@ -171,8 +164,8 @@ If you get GPU process crashes or network service errors (macOS):
 - Restart the app to apply the fix
 
 If you get "Invalid API key" errors:
-- Make sure `.env` file has your correct Finnhub API key
-- Restart the dev server after changing `.env`
+- Go to **Settings → Data Sources** and enter your correct Finnhub API key
+- The key takes effect immediately — no restart required
 
 ## 📚 Documentation
 

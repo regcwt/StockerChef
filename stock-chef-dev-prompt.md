@@ -57,7 +57,7 @@
 - 加载中显示 Spin 占位，API 限流时展示 Warning Alert
 
 **关键指数卡片**
-- 页面顶部展示 6 个预设指数：上证指数、科创综指、恒生指数、恒生科技、纳斯达克、标普500
+- 页面顶部展示 8 个预设指数：上证指数、深证成指、创业板指、纳斯达克、标普500、道琼斯、恒生指数、恒生科技
 - 数据来源：A 股指数 → AKShare；港股指数 → AKShare；美股指数 → AKShare（取最近两日日线计算涨跌）
 - 数据未到时显示占位符 `—`，不阻塞页面渲染
 
@@ -80,7 +80,7 @@
 
 **详情 Tab**
 - 通过 Finnhub `stock/profile2` 接口获取公司基本信息（仅美股）
-- 展示字段：公司名称、Symbol、市值（⚠️ 当前展示值偏小 100 万倍，已知 Bug）、行业/国家、开盘价、昨收价、日内高低、成交量、最后更新时间
+- 展示字段：公司名称、Symbol、市值、行业/国家、开盘价、昨收价、日内高低、成交量、最后更新时间
 
 **新闻 Tab**
 - 获取最近 7 天内最多 20 条相关新闻（Finnhub，仅美股）
@@ -158,11 +158,9 @@
 
 ### P0：修复已知 Bug
 
-#### BUG-001 修复：市值展示单位错误（待修复）
+#### BUG-001 修复：市值展示单位错误（✅ 已修复）
 - **问题**：`getProfile()` 返回的 `marketCapitalization` 单位是百万美元，但 `formatMarketCap()` 将其当作美元处理，导致展示值偏小 100 万倍
-- **修复方案 A**：在 `getProfile()` 中将 `data.marketCapitalization * 1_000_000` 后再赋值给 `Stock.marketCap`
-- **修复方案 B**：修改 `formatMarketCap()` 接受百万美元单位的输入，内部乘以 `1_000_000` 后再换算
-- **推荐方案 B**：改动范围更小，只需修改 `src/utils/format.ts`，不影响数据层
+- **修复方式**：修改 `formatMarketCap()` 接受百万美元单位的输入，内部乘以 `1_000_000` 后再换算（方案 B）
 
 #### BUG-002 修复：搜索结果不自动清空（待修复）
 - **问题**：点击搜索框外部空白处，搜索结果下拉列表不会关闭
@@ -310,7 +308,7 @@ interface PortfolioPosition {
 | `stock-get-cn-quote` | renderer → main | A 股实时行情（AKShare） |
 | `stock-search-cn` | renderer → main | A 股搜索（AKShare） |
 | `stock-get-hk-quote` | renderer → main | 港股实时行情（AKShare） |
-| `stock-get-indices` | renderer → main | 关键指数行情（6 个预设指数） |
+| `stock-get-indices` | renderer → main | 关键指数行情（8 个预设指数） |
 | `show-notification` | renderer → main | macOS 系统通知（价格提醒） |
 
 ### 待实现
@@ -332,7 +330,7 @@ interface PortfolioPosition {
 4. **港股行情**：`stock_hk_spot` 在部分网络环境下不可用，降级到 `stock_hk_daily`，总耗时约 10s，前端超时设为 35s
 5. **Finnhub API 限额**：免费层 60次/分钟，自选股超过 20 只时批量刷新会触发限流；默认刷新间隔已调整为 5 分钟
 6. **技术分析**：RSI/SMA 基于真实历史 K 线数据计算（AKShare/yfinance）；网络不通时降级为随机模拟，UI 标注 `[SIMULATED DATA]`
-7. **市值展示有 Bug**：Finnhub 返回的 `marketCapitalization` 单位是百万美元，`formatMarketCap()` 将其当作美元处理，展示值偏小 100 万倍（见 BUG-001，待修复）
+7. **市值展示**：`formatMarketCap()` 已修复，接受百万美元单位输入，内部乘以 `1_000_000` 后换算
 8. **仅支持 macOS 打包**：`electron-builder` 配置仅生成 `.dmg`，Windows/Linux 需额外配置
 9. **无自动化测试**：当前无单元测试和 E2E 测试，修改后需手动验证（`npx tsc --noEmit` 是唯一自动化验证手段）
 10. **Python 数据层 stdout 保护**：所有调用 AKShare 的 Python 函数必须在 `sys.stdout = sys.stderr` 保护下运行，防止 tqdm 进度条污染 JSON 输出

@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { fetchQuotes } from '@/services/eastmoney';
 import { Input, Button, Spin, Alert, Typography, Space, Tag, Modal, InputNumber, Switch, Tooltip } from 'antd';
 import {
   SearchOutlined,
@@ -23,9 +24,9 @@ import {
 import { CSS } from '@dnd-kit/utilities';
 import { useStockStore, getChangeColors, COLUMN_DEFINITIONS } from '@/store/useStockStore';
 import type { AlertThreshold, ColumnKey } from '@/store/useStockStore';
-import { getQuoteDirect, searchSymbol, handleAPIError, isCNStock, isHKStock, searchCNSymbol } from '@/services/stockApi';
+import { searchSymbol, handleAPIError, isCNStock, isHKStock, searchCNSymbol } from '@/services/stockApi';
 import type { SearchResult, Quote } from '@/types';
-import { formatPrice, formatPercent } from '@/utils/format';
+import { formatPercent, formatPriceByMarket } from '@/utils/format';
 
 const { Title, Text } = Typography;
 
@@ -73,20 +74,25 @@ const formatVolume = (volume?: number): string => {
 const isPlaceholderQuote = (quote: Quote): boolean =>
   quote.price === 0 && quote.change === 0 && quote.changePercent === 0;
 
-/** 根据 columnKey 从 quote 中取对应的显示值 */
+/** 根据 columnKey 从 quote 中取对应的显示值（按 symbol 自动选择币种符号 ¥/HK$/$） */
 const getCellValue = (key: ColumnKey, symbol: string, quote: Quote | undefined): string => {
   if (!quote) return '—';
   // 占位 quote（数据获取失败）：symbol 列正常显示，其他列显示 —
   if (key !== 'symbol' && isPlaceholderQuote(quote)) return '—';
+  // 数值字段缺失时显示 —，避免 0 与"无数据"混淆
+  const fmt = (v: number | undefined): string =>
+    v === undefined || v === null ? '—' : formatPriceByMarket(v, symbol);
   switch (key) {
     case 'symbol':        return symbol;
-    case 'price':         return formatPrice(quote.price);
-    case 'change':        return quote.change >= 0 ? `+${formatPrice(quote.change)}` : formatPrice(quote.change);
+    case 'price':         return fmt(quote.price);
+    case 'change':        return quote.change >= 0
+                            ? `+${formatPriceByMarket(quote.change, symbol)}`
+                            : formatPriceByMarket(quote.change, symbol);
     case 'changePercent': return formatPercent(quote.changePercent);
-    case 'high':          return formatPrice(quote.high ?? 0);
-    case 'low':           return formatPrice(quote.low ?? 0);
-    case 'open':          return formatPrice(quote.open ?? 0);
-    case 'previousClose': return formatPrice(quote.previousClose ?? 0);
+    case 'high':          return fmt(quote.high);
+    case 'low':           return fmt(quote.low);
+    case 'open':          return fmt(quote.open);
+    case 'previousClose': return fmt(quote.previousClose);
     case 'volume':        return formatVolume(quote.volume);
     default:              return '—';
   }
@@ -128,6 +134,19 @@ const SortableItem = ({ symbol, onStockClick, children }: {
     </div>
   );
 };
+
+/** 预设指数列表，顺序固定，提取到模块级避免每次渲染重新创建。
+ *  与 src/services/eastmoney.ts 的 INDEX_SECID_MAP 保持一致（共 8 个）。 */
+const PRESET_INDICES = [
+  { symbol: '000001.SH', name: '上证指数' },
+  { symbol: '399001.SZ', name: '深证成指' },
+  { symbol: '399006.SZ', name: '创业板指' },
+  { symbol: '.IXIC',     name: '纳斯达克' },
+  { symbol: '.INX',      name: '标普500'  },
+  { symbol: '.DJI',      name: '道琼斯'   },
+  { symbol: 'HSI',       name: '恒生指数' },
+  { symbol: 'HSTECH',    name: '恒生科技' },
+] as const;
 
 const Dashboard = ({ onStockClick }: DashboardProps) => {
   const {
@@ -189,20 +208,22 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
     }
   };
 
-  // 根据过滤条件过滤股票
-  const filteredWatchlist = watchlist.filter(symbol => {
+  // 根据过滤条件过滤股票（useMemo 避免每次渲染都重新遍历）
+  const filteredWatchlist = useMemo(() => watchlist.filter(symbol => {
     if (filter === 'all') return true;
     if (filter === 'cn') return isCNStock(symbol);
     if (filter === 'hk') return isHKStock(symbol);
     if (filter === 'us') return !isCNStock(symbol) && !isHKStock(symbol);
     return true;
-  });
+  }), [watchlist, filter]);
 
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [searching, setSearching] = useState(false);
   // 是否正在从缓存恢复后的后台刷新（区别于用户手动刷新）
   const [backgroundRefreshing, setBackgroundRefreshing] = useState(false);
+  // 用户手动点击刷新按钮时的 loading 状态
+  const [isManualRefreshing, setIsManualRefreshing] = useState(false);
 
   // 预置股票数据缓存（用于本地快速搜索）
   const [presetStocks, setPresetStocks] = useState<{
@@ -264,7 +285,6 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
       // 指数数据不依赖 watchlist，在 init 完成后立即触发首次加载
       // 原因：useEffect 的 initialized 守卫会在下一个 render 周期才执行，
       // 而 initDashboard 里直接调用可以确保首次加载立即发起
-      console.log('[INDICES DEBUG] Dashboard: Calling fetchIndices from initDashboard');
       useStockStore.getState().fetchIndices();
     };
     initDashboard();
@@ -300,109 +320,45 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
     }
   };
 
-  const fetchAllQuotes = async () => {
-    if (watchlist.length === 0) return;
+  // 用 ref 存储最新的 watchlist 和 alertThresholds，避免 fetchAllQuotes 捕获旧闭包
+  // 这样 setInterval 的回调始终能读到最新值，无需每次 watchlist 变化都重建 interval
+  const watchlistRef = useRef(watchlist);
+  const alertThresholdsRef = useRef(alertThresholds);
+  useEffect(() => { watchlistRef.current = watchlist; }, [watchlist]);
+  useEffect(() => { alertThresholdsRef.current = alertThresholds; }, [alertThresholds]);
+
+  const fetchAllQuotes = useCallback(async () => {
+    const currentWatchlist = watchlistRef.current;
+    if (currentWatchlist.length === 0) return;
     setError(null);
     try {
-      // 将 watchlist 按 A 股 / 港股 / 美股分组
-      const cnSymbols = watchlist.filter(isCNStock);
-      const hkSymbols = watchlist.filter(isHKStock);
-      const usSymbols = watchlist.filter((s) => !isCNStock(s) && !isHKStock(s));
-
-      // A 股：批量通过 AKShare 获取（一次调用）
-      const cnQuotePromise: Promise<Quote[]> = cnSymbols.length > 0
-        ? (async () => {
-            try {
-              const rawJson = await window.electronAPI.getCNQuote(cnSymbols.join(','));
-              const parsed = JSON.parse(rawJson);
-              if (Array.isArray(parsed)) {
-                // 顺便保存公司名称（A 股行情数据里有 name 字段）
-                parsed.forEach((item: any) => {
-                  if (item.symbol && item.name && item.name !== item.symbol) {
-                    useStockStore.getState().setSymbolName(item.symbol, item.name);
-                  }
-                });
-                return parsed.map((item: any): Quote => ({
-                  symbol: item.symbol,
-                  price: item.price ?? 0,
-                  change: item.change ?? 0,
-                  changePercent: item.changePercent ?? 0,
-                  high: item.high,
-                  low: item.low,
-                  open: item.open,
-                  previousClose: item.previousClose,
-                  volume: item.volume,
-                  timestamp: new Date().toISOString(),
-                }));
-              }
-            } catch {
-              // AKShare 不可用时静默跳过
-            }
-            return [];
-          })()
-        : Promise.resolve([]);
-
-      // 港股：通过 AKShare 获取（一次调用，支持 XXXXX.HK 格式）
-      // 加 90 秒超时兜底：AKShare 港股首次调用需要缓存全量数据（约 2745 只），耗时约 55 秒
-      // 后续调用会使用缓存，速度会快很多
-      const hkQuotePromise: Promise<Quote[]> = hkSymbols.length > 0
-        ? Promise.race([
-            (async () => {
-              console.log('[HK DEBUG] Fetching HK quotes for symbols:', hkSymbols);
-              try {
-                const rawJson = await window.electronAPI.getHKQuote(hkSymbols.join(','));
-                console.log('[HK DEBUG] Raw JSON response:', rawJson);
-                const parsed = JSON.parse(rawJson);
-                console.log('[HK DEBUG] Parsed result:', parsed);
-                console.log('[HK DEBUG] Is array?', Array.isArray(parsed));
-                if (Array.isArray(parsed)) {
-                  // 顺便保存公司名称（港股行情数据里有 name 字段，stock_hk_spot 返回中文名）
-                  parsed.forEach((item: any) => {
-                    if (item.symbol && item.name && item.name !== item.symbol) {
-                      useStockStore.getState().setSymbolName(item.symbol, item.name);
-                    }
-                  });
-                  return parsed.map((item: any): Quote => ({
-                    symbol: item.symbol,
-                    price: item.price ?? 0,
-                    change: item.change ?? 0,
-                    changePercent: item.changePercent ?? 0,
-                    high: item.high,
-                    low: item.low,
-                    open: item.open,
-                    previousClose: item.previousClose,
-                    volume: item.volume,
-                    timestamp: new Date().toISOString(),
-                  }));
-                }
-              } catch (err) {
-                console.error('[HK DEBUG] Error fetching HK quotes:', err);
-                // AKShare 不可用时静默跳过
-              }
-              return [] as Quote[];
-            })(),
-            new Promise<Quote[]>((resolve) => setTimeout(() => resolve([]), 90000)),
-          ])
-        : Promise.resolve([]);
-
-      // 美股：直接并发请求（不走限流队列），多只股票同时发出，大幅缩短刷新时间
-      // Finnhub 免费层 60次/分钟，10只以内自选股并发完全安全
-      const usQuotePromises = usSymbols.map(async (symbol) => {
-        try {
-          return await getQuoteDirect(symbol);
-        } catch (err: any) {
-          if (err.response?.status === 429) {
-            setRateLimited(true);
-            setTimeout(() => setRateLimited(false), 60000);
+      // 统一一次东方财富 push2 请求拿全部行情，无需按 A 股 / 港股 / 美股分组
+      // fetchQuotes 内部会按 symbol 自动派发到对应市场代码（0./1./116./105./106.）
+      let validQuotes: Quote[] = [];
+      try {
+        const results = await fetchQuotes(currentWatchlist);
+        // 顺便保存公司名称（东方财富行情数据里有 name 字段）
+        results.forEach((item) => {
+          if (item.symbol && item.name && item.name !== item.symbol) {
+            useStockStore.getState().setSymbolName(item.symbol, item.name);
           }
-          return null;
-        }
-      });
+        });
+        validQuotes = results.map((item): Quote => ({
+          symbol: item.symbol,
+          price: item.price,
+          change: item.change,
+          changePercent: item.changePercent,
+          high: item.high,
+          low: item.low,
+          open: item.open,
+          previousClose: item.previousClose,
+          volume: item.volume,
+          timestamp: new Date().toISOString(),
+        }));
+      } catch {
+        // 东方财富不可用时静默跳过，下方占位逻辑会接管
+      }
 
-      const [cnQuotes, hkQuotes, ...usResults] = await Promise.all([cnQuotePromise, hkQuotePromise, ...usQuotePromises]);
-      const validQuotes = [...cnQuotes, ...hkQuotes, ...usResults.filter((q): q is Quote => q !== null)];
-      console.log('[HK DEBUG] Valid quotes to update:', validQuotes);
-      console.log('[HK DEBUG] HK quotes array:', hkQuotes);
       useStockStore.getState().updateQuotes(validQuotes);
       validQuotes.forEach((quote) => checkAlertThreshold(quote.symbol, quote));
 
@@ -416,7 +372,7 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
       // 场景：港股 yfinance 限流、A 股 AKShare 不可用、Finnhub Key 缺失等
       const fetchedSymbols = new Set(validQuotes.map((q) => q.symbol));
       const currentQuotes = useStockStore.getState().quotes;
-      const placeholderQuotes: Quote[] = watchlist
+      const placeholderQuotes: Quote[] = currentWatchlist
         .filter((s) => !fetchedSymbols.has(s) && currentQuotes[s] === undefined)
         .map((s): Quote => ({
           symbol: s,
@@ -433,7 +389,12 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
     } finally {
       setBackgroundRefreshing(false);
     }
-  };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [setError, setRateLimited]);
+
+  // refreshInterval ref，避免 interval useEffect 因 refreshInterval 变化而重建
+  const refreshIntervalRef = useRef(refreshInterval);
+  useEffect(() => { refreshIntervalRef.current = refreshInterval; }, [refreshInterval]);
 
   useEffect(() => {
     // 守卫：init 未完成时不启动刷新
@@ -441,19 +402,23 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
     // 加守卫后，只有 init 完成（initialized=true）后才会真正启动刷新和 interval
     if (!initialized) return;
     fetchAllQuotes();
-    const interval = setInterval(fetchAllQuotes, refreshInterval * 1000);
-    return () => clearInterval(interval);
-  }, [initialized, watchlist, refreshInterval]);
+    // 用动态 interval：每次 tick 时读取最新的 refreshInterval，避免 interval 因 refreshInterval 变化重建
+    const intervalId = setInterval(() => fetchAllQuotes(), refreshIntervalRef.current * 1000);
+    return () => clearInterval(intervalId);
+  // fetchAllQuotes 是 useCallback，依赖稳定；watchlist 变化通过 watchlistRef 感知，无需加入依赖
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialized, fetchAllQuotes]);
 
-  // 指数刷新独立 useEffect：不依赖 watchlist，只跟随 refreshInterval
-  // 原因：指数是预设固定列表，与自选股无关，不应因 watchlist 变化而重复触发
+  // 指数刷新独立 useEffect：组件挂载时立即拉取一次，之后按 refreshInterval 轮询
+  // 原因：指数是预设固定列表，与 watchlist / refreshInterval 等异步加载状态无关，
+  //       无需等 initDashboard 完成；启动时必须立刻有数据，避免首屏长时间 `—` 占位
   useEffect(() => {
-    if (!initialized) return;
-    console.log('[INDICES DEBUG] Dashboard: Calling fetchIndices from interval useEffect');
     fetchIndices();
-    const interval = setInterval(fetchIndices, refreshInterval * 1000);
-    return () => clearInterval(interval);
-  }, [initialized, refreshInterval]);
+    const intervalId = setInterval(() => fetchIndices(), refreshIntervalRef.current * 1000);
+    return () => clearInterval(intervalId);
+  // 仅在挂载时执行；fetchIndices 是 zustand 稳定引用，refreshIntervalRef 通过 ref 读最新值
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleSearch = async (query: string) => {
     setSearchQuery(query);
@@ -591,51 +556,28 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
   };
 
   /**
-   * 添加新股票后立即获取该股票的最新报价，不等待下一个 interval 周期
-   * 根据 symbol 类型走对应数据源（A股→AKShare，港股→yfinance，美股→Finnhub）
+   * 添加新股票后立即获取该股票的最新报价，不等待下一个 interval 周期。
+   * 统一走 fetchQuotes，内部自动按 symbol 推断市场代码（A 股 / 港股 / 美股），
+   * 调用方无需关心 symbol 属于哪个市场。
    */
   const fetchSingleQuote = async (symbol: string): Promise<void> => {
     try {
       let quote: Quote | null = null;
-
-      if (isCNStock(symbol)) {
-        const rawJson = await window.electronAPI.getCNQuote(symbol);
-        const parsed = JSON.parse(rawJson);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          const item = parsed[0];
-          quote = {
-            symbol: item.symbol,
-            price: item.price ?? 0,
-            change: item.change ?? 0,
-            changePercent: item.changePercent ?? 0,
-            high: item.high,
-            low: item.low,
-            open: item.open,
-            previousClose: item.previousClose,
-            volume: item.volume,
-            timestamp: new Date().toISOString(),
-          };
-        }
-      } else if (isHKStock(symbol)) {
-        const rawJson = await window.electronAPI.getHKQuote(symbol);
-        const parsed = JSON.parse(rawJson);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          const item = parsed[0];
-          quote = {
-            symbol: item.symbol,
-            price: item.price ?? 0,
-            change: item.change ?? 0,
-            changePercent: item.changePercent ?? 0,
-            high: item.high,
-            low: item.low,
-            open: item.open,
-            previousClose: item.previousClose,
-            volume: item.volume,
-            timestamp: new Date().toISOString(),
-          };
-        }
-      } else {
-        quote = await getQuoteDirect(symbol);
+      const results = await fetchQuotes([symbol]);
+      if (results.length > 0) {
+        const item = results[0];
+        quote = {
+          symbol: item.symbol,
+          price: item.price,
+          change: item.change,
+          changePercent: item.changePercent,
+          high: item.high,
+          low: item.low,
+          open: item.open,
+          previousClose: item.previousClose,
+          volume: item.volume,
+          timestamp: new Date().toISOString(),
+        };
       }
 
       if (quote) {
@@ -684,12 +626,24 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
   // 涨跌色
   const { up: upColor, down: downColor } = getChangeColors(colorMode);
 
-  // 统计涨跌数
-  const gainers = watchlist.filter((s) => (quotes[s]?.change ?? 0) >= 0).length;
+  // 统计涨跌数（useMemo 避免每次渲染都遍历 watchlist）
+  const gainers = useMemo(
+    () => watchlist.filter((s) => (quotes[s]?.change ?? 0) >= 0).length,
+    [watchlist, quotes],
+  );
   const losers = watchlist.length - gainers;
 
-  // 列定义（只取可见列）
-  const visibleColumnDefs = COLUMN_DEFINITIONS.filter((col) => visibleColumns.includes(col.key));
+  // 列定义（只取可见列，useMemo 避免每次渲染都重新过滤）
+  const visibleColumnDefs = useMemo(
+    () => COLUMN_DEFINITIONS.filter((col) => visibleColumns.includes(col.key)),
+    [visibleColumns],
+  );
+
+  // 指数数据 Map（useMemo 避免每次渲染都重新创建 Map）
+  const indexDataMap = useMemo(
+    () => new Map(indices.map((idx) => [idx.symbol, idx])),
+    [indices],
+  );
 
   return (
     <div style={{ maxWidth: 1400, margin: '0 auto' }}>
@@ -727,7 +681,15 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
                 </Tag>
                 <Button
                   icon={<ReloadOutlined />}
-                  onClick={() => fetchAllQuotes()}
+                  loading={isManualRefreshing}
+                  onClick={async () => {
+                    setIsManualRefreshing(true);
+                    try {
+                      await Promise.all([fetchAllQuotes(), fetchIndices()]);
+                    } finally {
+                      setIsManualRefreshing(false);
+                    }
+                  }}
                   style={{ borderRadius: 20, fontWeight: 500 }}
                 >
                   刷新
@@ -737,64 +699,47 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
           </div>
 
           {/* 右侧：关键指数卡片（始终展示预设 6 个，数据未到时用占位符）*/}
-          {(() => {
-            // 预设指数列表，顺序固定
-            const PRESET_INDICES = [
-              { symbol: '000001.SH', name: '上证指数' },
-              { symbol: '.IXIC',     name: '纳斯达克' },
-              { symbol: 'HSTECH',    name: '恒生科技' },
-              { symbol: '000688.SH', name: '科创综指' },
-              { symbol: 'HSI',       name: '恒生指数' },
-              { symbol: '.INX',      name: '标普500'  },
-            ];
-            // 用 symbol 建立快速查找 map
-            const indexDataMap = new Map(indices.map((idx) => [idx.symbol, idx]));
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+            {PRESET_INDICES.map(({ symbol, name }) => {
+              const data = indexDataMap.get(symbol);
+              const hasData = !!data;
+              const isUp = hasData && data.change >= 0;
+              const indexColor = hasData ? (isUp ? upColor : downColor) : '#c0cce0';
+              const sign = hasData && isUp ? '+' : '';
 
-            return (
-              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-                {PRESET_INDICES.map(({ symbol, name }) => {
-                  const data = indexDataMap.get(symbol);
-                  const hasData = !!data;
-                  const isUp = hasData && data.change >= 0;
-                  const indexColor = hasData ? (isUp ? upColor : downColor) : '#c0cce0';
-                  const sign = hasData && isUp ? '+' : '';
-
-                  return (
-                    <div
-                      key={symbol}
-                      style={{
-                        padding: '10px 16px',
-                        borderRadius: 14,
-                        background: 'rgba(255,255,255,0.7)',
-                        backdropFilter: 'blur(8px)',
-                        border: '1px solid rgba(79, 110, 247, 0.1)',
-                        boxShadow: '0 2px 8px rgba(0,0,0,0.05)',
-                        minWidth: 100,
-                        textAlign: 'center',
-                      }}
-                    >
-                      <div style={{ fontSize: 11, color: '#8a9cc8', fontWeight: 600, marginBottom: 4 }}>
-                        {name}
-                      </div>
-                      <div style={{ fontSize: 15, fontWeight: 800, color: hasData ? '#0f1a2e' : '#c0cce0', letterSpacing: '-0.02em', lineHeight: 1.2 }}>
-                        {hasData ? data.price.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : '—'}
-                      </div>
-                      <div style={{ fontSize: 11, fontWeight: 600, color: indexColor, marginTop: 3 }}>
-                        {hasData ? (
-                          <>
-                            {sign}{data.change.toFixed(2)}
-                            <span style={{ marginLeft: 4 }}>
-                              {sign}{data.changePercent.toFixed(2)}%
-                            </span>
-                          </>
-                        ) : '— —%'}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            );
-          })()}
+              return (
+                <div
+                  key={symbol}
+                  style={{
+                    padding: '10px 16px',
+                    borderRadius: 14,
+                    background: 'rgba(255,255,255,0.7)',
+                    backdropFilter: 'blur(8px)',
+                    border: '1px solid rgba(79, 110, 247, 0.1)',
+                    boxShadow: '0 2px 8px rgba(0,0,0,0.05)',
+                    minWidth: 100,
+                    textAlign: 'center',
+                  }}
+                >
+                  <div style={{ fontSize: 11, color: '#8a9cc8', fontWeight: 600, marginBottom: 4 }}>
+                    {name}
+                  </div>
+                  <div style={{ fontSize: 15, fontWeight: 800, color: hasData ? '#0f1a2e' : '#c0cce0', letterSpacing: '-0.02em', lineHeight: 1.2 }}>
+                    {hasData ? data.price.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : '—'}
+                  </div>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: indexColor, marginTop: 3 }}>
+                    {hasData ? (
+                      <>
+                        {sign}{data.change.toFixed(2)}
+                        <span style={{ marginLeft: 4 }}>
+                          {sign}{data.changePercent.toFixed(2)}%
+                        </span>
+                      </>
+                    ) : '— —%'}
+                  </div>
+                </div>
+              );
+            })}</div>
         </div>
       </div>
 
@@ -982,8 +927,8 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
           <div
             style={{
               display: 'grid',
-              gridTemplateColumns: `${buildGridTemplate(visibleColumnDefs.map((c) => c.key))} 100px auto`,
-              gridColumnGap: '4px',
+              gridTemplateColumns: `${buildGridTemplate(visibleColumnDefs.map((c) => c.key))} 80px 72px`,
+              gridColumnGap: '8px',
               padding: '10px 16px',
               background: 'rgba(79, 110, 247, 0.04)',
               borderBottom: '1px solid rgba(79, 110, 247, 0.1)',
@@ -1021,15 +966,6 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
             >
               {filteredWatchlist.map((symbol, rowIndex) => {
                 const quote = quotes[symbol];
-                // 关键调试：记录 03690.HK 的渲染数据
-                if (symbol === '03690.HK') {
-                  console.log('[HK DEBUG RENDER] ===== 渲染 03690.HK =====');
-                  console.log('[HK DEBUG RENDER] Symbol:', symbol);
-                  console.log('[HK DEBUG RENDER] Quote:', quote);
-                  console.log('[HK DEBUG RENDER] Quote keys:', quote ? Object.keys(quote) : 'undefined');
-                  console.log('[HK DEBUG RENDER] Is placeholder?', quote ? (quote.price === 0 && quote.change === 0 && quote.changePercent === 0) : 'N/A');
-                  console.log('[HK DEBUG RENDER] All store quotes keys:', Object.keys(quotes));
-                }
                 const isPositive = quote ? quote.change >= 0 : true;
                 const changeColor = isPositive ? upColor : downColor;
                 const isLastRow = rowIndex === filteredWatchlist.length - 1;
@@ -1044,8 +980,8 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
                     <div
                       style={{
                         display: 'grid',
-                        gridTemplateColumns: `${buildGridTemplate(visibleColumnDefs.map((c) => c.key))} 100px auto`,
-                        gridColumnGap: '4px',
+                        gridTemplateColumns: `${buildGridTemplate(visibleColumnDefs.map((c) => c.key))} 80px 72px`,
+                        gridColumnGap: '8px',
                         padding: '14px 16px',
                         borderBottom: isLastRow ? 'none' : '1px solid rgba(79, 110, 247, 0.06)',
                         cursor: 'pointer',
@@ -1092,8 +1028,8 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
                         style={{
                           display: 'flex',
                           alignItems: 'center',
-                          justifyContent: 'space-between',
-                          gap: 4,
+                          justifyContent: 'center',
+                          gap: 2,
                           padding: '2px',
                         }}
                         onClick={(e) => e.stopPropagation()}
@@ -1320,7 +1256,7 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
 /** 根据列 key 列表生成 CSS grid-template-columns */
 const buildGridTemplate = (keys: ColumnKey[]): string => {
   const widthMap: Record<ColumnKey, string> = {
-    symbol:        '80px',
+    symbol:        'minmax(80px, 1fr)',
     price:         '1fr',
     change:        '1fr',
     changePercent: '1fr',
@@ -1331,8 +1267,7 @@ const buildGridTemplate = (keys: ColumnKey[]): string => {
     volume:        '1fr',
   };
   const colWidths = keys.map((key) => widthMap[key] ?? '1fr').join(' ');
-  // 最后追加操作列固定宽度
-  return `${colWidths} 72px`;
+  return colWidths;
 };
 
 export default Dashboard;

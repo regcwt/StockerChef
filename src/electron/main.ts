@@ -3,6 +3,12 @@ import { join, resolve } from 'path';
 import { execFile } from 'child_process';
 import Store from 'electron-store';
 import { readFileSync, existsSync } from 'fs';
+import {
+  fetchCNQuotes,
+  fetchHKQuotes,
+  fetchUSQuotes,
+  fetchIndices as fetchEastMoneyIndices,
+} from '../services/eastmoney';
 
 // Disable hardware acceleration to prevent GPU process crashes on macOS
 // This is safe for stock dashboard apps that don't need 3D rendering
@@ -32,36 +38,55 @@ function createWindow() {
     },
   });
 
-  // 设置 Content-Security-Policy，消除 Electron 安全警告
-  // 开发模式需要允许 localhost Vite dev server 的 ws:// 和 http://
+  // ── 全局放开跨域：所有渲染进程发起的 HTTP/HTTPS 请求允许任意源 ────────────
+  // 1. CSP 的 connect-src 放开为 * https: http:，允许 fetch/axios 调用任意域名
+  // 2. 响应头注入 Access-Control-Allow-* 系列，让浏览器侧 CORS 预检通过
+  // 3. 同时拦截 OPTIONS 预检请求，直接返回 200 + 完整 CORS 头
+  //
+  // ⚠️ 安全权衡：保留 contextIsolation: true + nodeIntegration: false（renderer 仍无 Node 能力）
+  //              仅放开网络层 CORS，等价于浏览器扩展 "Allow CORS"，对桌面端股票看板可接受
   mainWindow.webContents.session.webRequest.onHeadersReceived((details, callback) => {
-    const isDev = !!process.env.VITE_DEV_SERVER_URL;
-    const csp = isDev
+    const csp = app.isPackaged
       ? [
-          "default-src 'self' 'unsafe-inline' http://localhost:* ws://localhost:*;",
-          "script-src 'self' 'unsafe-inline';",
-          "style-src 'self' 'unsafe-inline';",
-          "img-src 'self' data: https:;",
-          "connect-src 'self' https://finnhub.io http://localhost:* ws://localhost:*;",
-        ].join(' ')
-      : [
           "default-src 'self';",
           "script-src 'self';",
           "style-src 'self' 'unsafe-inline';",
-          "img-src 'self' data: https:;",
-          "connect-src 'self' https://finnhub.io;",
+          "img-src 'self' data: https: http:;",
+          "connect-src 'self' https: http: ws: wss: data:;",
+        ].join(' ')
+      : [
+          "default-src 'self' 'unsafe-inline' http://localhost:* ws://localhost:*;",
+          "script-src 'self' 'unsafe-inline';",
+          "style-src 'self' 'unsafe-inline';",
+          "img-src 'self' data: https: http:;",
+          "connect-src 'self' https: http: ws: wss: data: http://localhost:* ws://localhost:*;",
         ].join(' ');
 
+    // electron 的 responseHeaders 值是 string[]，统一去掉服务器原本可能返回的 CORS 头，避免冲突
+    const cleanedHeaders: Record<string, string[]> = {};
+    for (const [key, value] of Object.entries(details.responseHeaders ?? {})) {
+      if (!/^access-control-/i.test(key)) {
+        cleanedHeaders[key] = Array.isArray(value) ? value : [String(value)];
+      }
+    }
+
+    // 注：Access-Control-Allow-Origin 设为 *，不能同时启用 Allow-Credentials: true（CORS 规范限制）
+    //     桌面应用不依赖第三方 cookie，可接受。如未来需要发凭证请求，再改为按 Origin 回写。
     callback({
       responseHeaders: {
-        ...details.responseHeaders,
+        ...cleanedHeaders,
         'Content-Security-Policy': [csp],
+        'Access-Control-Allow-Origin': ['*'],
+        'Access-Control-Allow-Methods': ['GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD'],
+        'Access-Control-Allow-Headers': ['*'],
+        'Access-Control-Expose-Headers': ['*'],
+        'Access-Control-Max-Age': ['86400'],
       },
     });
   });
 
-  if (process.env.VITE_DEV_SERVER_URL) {
-    mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
+  if (!app.isPackaged) {
+    mainWindow.loadURL('http://localhost:5173');
     mainWindow.webContents.openDevTools();
   } else {
     mainWindow.loadFile(join(__dirname, '../dist/index.html'));
@@ -79,7 +104,7 @@ app.disableHardwareAcceleration();
 app.whenReady().then(() => {
   // 开发模式下手动设置 Dock 图标（打包后由 electron-builder 自动处理）
   // 用 try-catch 包裹，避免路径不存在时抛出未捕获异常导致 UnhandledPromiseRejection
-  if (process.platform === 'darwin' && process.env.VITE_DEV_SERVER_URL) {
+  if (process.platform === 'darwin' && !app.isPackaged) {
     try {
       // 开发模式下 __dirname = dist-electron/，icon.png 在项目根的 resources/ 下
       // 正确路径：dist-electron/../resources/icon.png（一层 ..，不是两层）
@@ -147,10 +172,10 @@ ipcMain.handle('settings-set', (_event, key: string, value: unknown) => {
 // ── Python 脚本路径辅助 ──────────────────────────────────────────────────────
 // 统一入口：scripts/main.py（基于 providers/ 包的多 Provider 架构）
 function getPythonScriptPath(): string {
-  return process.env.VITE_DEV_SERVER_URL
+  return app.isPackaged
+    ? join(process.resourcesPath, 'scripts/main.py')
     // 开发模式：__dirname = dist-electron/，scripts/ 在项目根，只需一层 ..
-    ? join(__dirname, '../scripts/main.py')
-    : join(process.resourcesPath, 'scripts/main.py');
+    : join(__dirname, '../scripts/main.py');
 }
 
 // ── Provider 优先级辅助 ───────────────────────────────────────────────────────
@@ -221,17 +246,26 @@ function buildTokenArgs(): string[] {
 }
 
 // IPC handler for A 股实时行情
-// 数据源优先级由 settings.cnProviderPriority 控制，默认 tushare → akshare
+// 优先使用东方财富 push2 HTTP API（Node.js fetch，毫秒级），降级到 Python
 ipcMain.handle('stock-get-cn-quote', (_event, symbols: string): Promise<string> => {
-  return new Promise((resolve) => {
-    const args = [
-      '--action', 'cn_quote',
-      '--symbols', symbols,
-      '--cn-providers', getCnProviders(),
-      ...buildTokenArgs(),
-    ];
-    runPythonScript(args, 60000, resolve);
-  });
+  const symbolList = symbols.split(',').map((s) => s.trim()).filter(Boolean);
+
+  // 优先：东方财富 push2（Node.js fetch，无需 Python）
+  return fetchCNQuotes(symbolList)
+    .then((result) => JSON.stringify(result))
+    .catch((err) => {
+      // 降级：Python Provider 链
+      console.warn('[CN Quote] 东方财富失败，降级到 Python:', err.message);
+      return new Promise<string>((resolve) => {
+        const args = [
+          '--action', 'cn_quote',
+          '--symbols', symbols,
+          '--cn-providers', getCnProviders(),
+          ...buildTokenArgs(),
+        ];
+        runPythonScript(args, 60000, resolve);
+      });
+    });
 });
 
 // IPC handler for A 股搜索
@@ -249,37 +283,69 @@ ipcMain.handle('stock-search-cn', (_event, query: string): Promise<string> => {
 });
 
 // IPC handler for 港股实时行情
-// 数据源优先级由 settings.hkProviderPriority 控制，默认 akshare_hk
-// 注意：AKShare 港股需要缓存全量数据（约 2745 只），首次调用需要 ~55 秒
+// 优先使用东方财富 push2 HTTP API（Node.js fetch，毫秒级），降级到 Python AKShare
 ipcMain.handle('stock-get-hk-quote', (_event, symbols: string): Promise<string> => {
-  return new Promise((resolve) => {
-    console.log('[HK DEBUG main.ts] Getting HK quote for symbols:', symbols);
-    const args = [
-      '--action', 'hk_quote',
-      '--symbols', symbols,
-      '--hk-providers', getHkProviders(),
-    ];
-    console.log('[HK DEBUG main.ts] Python args:', args);
-    // 增加到 90 秒以允许 AKShare 完成缓存（首次约 55 秒，后续会使用缓存）
-    runPythonScript(args, 90000, (result) => {
-      console.log('[HK DEBUG main.ts] Python result:', result);
-      resolve(result);
+  const symbolList = symbols.split(',').map((s) => s.trim()).filter(Boolean);
+
+  return fetchHKQuotes(symbolList)
+    .then((result) => JSON.stringify(result))
+    .catch((err) => {
+      // 降级：Python Provider 链（AKShare stock_hk_spot）
+      console.warn('[HK Quote] 东方财富失败，降级到 Python:', err.message);
+      return new Promise<string>((resolve) => {
+        const args = [
+          '--action', 'hk_quote',
+          '--symbols', symbols,
+          '--hk-providers', getHkProviders(),
+        ];
+        // 增加到 90 秒以允许 AKShare 完成缓存（首次约 55 秒，后续会使用缓存）
+        runPythonScript(args, 90000, resolve);
+      });
     });
-  });
+});
+
+// IPC handler for 美股实时行情
+// 优先使用东方财富 push2 HTTP API（按 ticker 白名单精准选择 105/106 市场代码），降级到 Python
+ipcMain.handle('stock-get-us-quote', (_event, symbols: string): Promise<string> => {
+  const symbolList = symbols.split(',').map((s) => s.trim()).filter(Boolean);
+
+  return fetchUSQuotes(symbolList)
+    .then((result) => JSON.stringify(result))
+    .catch((err) => {
+      // 降级：Python Provider 链（Finnhub → yfinance）
+      console.warn('[US Quote] 东方财富失败，降级到 Python:', err.message);
+      return new Promise<string>((resolve) => {
+        const args = [
+          '--action', 'us_quote',
+          '--symbols', symbols,
+          '--us-providers', getUsProviders(),
+          ...buildTokenArgs(),
+        ];
+        runPythonScript(args, 60000, resolve);
+      });
+    });
 });
 
 // IPC handler for 关键指数行情
-// 数据源：A 股指数（上证、科创综指）→ AKShare stock_zh_index_daily
-//         港股指数（恒生、恒生科技）→ AKShare stock_hk_index_spot_sina
-//         美股指数（纳斯达克、标普）→ AKShare index_us_stock_sina（最近两日对比计算涨跌）
-ipcMain.handle('stock-get-indices', (): Promise<string> => {
-  return new Promise((resolve) => {
-    console.log('[INDICES DEBUG] main.ts: Executing Python script for get_indices');
-    runPythonScript(['--action', 'get_indices'], 60000, (result) => {
-      console.log('[INDICES DEBUG] main.ts: Python script result:', result);
-      resolve(result);
-    });
-  });
+// 走东方财富 push2 HTTP API（主进程 node:https，一次请求获取全部 8 个指数）
+// ⚠️ 按需求**不再降级到 Python**：失败直接把真实错误（含 cause）回传前端，便于排查
+ipcMain.handle('stock-get-indices', async (): Promise<string> => {
+  console.log('[INDICES] 收到 stock-get-indices 请求，开始调用东方财富');
+  try {
+    const result = await fetchEastMoneyIndices();
+    console.log('[INDICES] 东方财富返回', result.length, '个指数:',
+                result.map((r) => `${r.symbol}=${r.price}`).join(', '));
+    return JSON.stringify(result);
+  } catch (err) {
+    // 把根因（含 undici 的 cause）尽量完整地打到主进程日志和前端
+    const cause = (err as { cause?: unknown }).cause;
+    const detail = err instanceof Error
+      ? `${err.name}: ${err.message}${cause ? ` | cause=${cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause)}` : ''}`
+      : String(err);
+    console.error('[INDICES] 东方财富指数请求失败（不再降级到 Python）:', detail);
+    if (err instanceof Error && err.stack) console.error(err.stack);
+    return JSON.stringify({ error: 'indices_fetch_failed', message: detail });
+  }
 });
 
 // IPC handler for system notifications（股价/涨幅阈值触发提醒）
@@ -295,9 +361,9 @@ ipcMain.handle('show-notification', (_event, title: string, body: string) => {
 
 function getPresetStockDataPath(market: 'cn' | 'hk' | 'us'): string {
   const filename = `stocks-${market}.json`;
-  return process.env.VITE_DEV_SERVER_URL
-    ? join(__dirname, `../data/${filename}`)
-    : join(process.resourcesPath, `data/${filename}`);
+  return app.isPackaged
+    ? join(process.resourcesPath, `data/${filename}`)
+    : join(__dirname, `../data/${filename}`);
 }
 
 ipcMain.handle('stock-get-preset-data', (_event, market: 'cn' | 'hk' | 'us'): string => {

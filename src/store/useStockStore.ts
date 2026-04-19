@@ -1,5 +1,16 @@
 import { create } from 'zustand';
-import type { Quote, StockQuestion, IndexQuote } from '@/types';
+import type { Quote, Conversation, ConversationMessage, IndexQuote, UserProfile } from '@/types';
+
+/** 随机 emoji 头像池 */
+const EMOJI_AVATAR_POOL = ['🐯', '🦊', '🐼', '🐨', '🦁', '🐸', '🦄', '🐙', '🦋', '🐬'];
+/** 随机用户名池 */
+const USERNAME_POOL = ['投资达人', '股市老手', '价值猎手', '趋势追踪者', '量化先锋', '长线持有者', '波段高手'];
+
+/** 生成默认用户资料（随机 emoji + 随机用户名） */
+const generateDefaultUserProfile = (): UserProfile => ({
+  username: USERNAME_POOL[Math.floor(Math.random() * USERNAME_POOL.length)],
+  emojiAvatar: EMOJI_AVATAR_POOL[Math.floor(Math.random() * EMOJI_AVATAR_POOL.length)],
+});
 
 /** 涨跌色风格：cn = 红涨绿跌（中国），us = 绿涨红跌（美股） */
 export type ColorMode = 'cn' | 'us';
@@ -124,18 +135,30 @@ interface StockState {
   loadQuotesCache: () => Promise<boolean>;
   /** 将当前 quotes 快照保存到 electron-store */
   saveQuotesCache: () => Promise<void>;
-  /** 用户在分析页面输入的历史问题列表 */
-  questions: StockQuestion[];
-  /** 从 electron-store 加载历史问题 */
-  loadQuestions: () => Promise<void>;
-  /** 新增一条问题记录并持久化 */
-  addQuestion: (symbol: string, question: string) => Promise<void>;
-  /** 删除指定 id 的问题记录 */
-  deleteQuestion: (id: string) => Promise<void>;
+  /** 历史对话列表（按 updatedAt 倒序） */
+  conversations: Conversation[];
+  /** 当前激活的对话 ID */
+  activeConversationId: string | null;
+  /** 从 electron-store 加载历史对话 */
+  loadConversations: () => Promise<void>;
+  /** 创建一条新对话，返回新对话 ID */
+  createConversation: (symbol?: string) => Promise<string>;
+  /** 向指定对话追加一条消息 */
+  appendMessage: (conversationId: string, message: Omit<ConversationMessage, 'id' | 'createdAt'>) => Promise<ConversationMessage>;
+  /** 删除指定 id 的对话 */
+  deleteConversation: (id: string) => Promise<void>;
+  /** 设置当前激活的对话 ID */
+  setActiveConversationId: (id: string | null) => void;
   /** 关键指数行情（上证、科创综指、纳斯达克、标普、恒生、恒生科技） */
   indices: IndexQuote[];
   /** 拉取最新指数行情，失败时静默保留上次数据 */
   fetchIndices: () => Promise<void>;
+  /** 用户个人资料（头像 + 用户名） */
+  userProfile: UserProfile;
+  /** 从 electron-store 加载用户资料，若无则生成随机默认值 */
+  loadUserProfile: () => Promise<void>;
+  /** 保存用户资料到 electron-store */
+  saveUserProfile: (profile: UserProfile) => Promise<void>;
 }
 
 export const useStockStore = create<StockState>((set, get) => ({
@@ -149,8 +172,10 @@ export const useStockStore = create<StockState>((set, get) => ({
   refreshInterval: 300,
   alertThresholds: {},
   visibleColumns: DEFAULT_VISIBLE_COLUMNS,
-  questions: [],
+  conversations: [],
+  activeConversationId: null,
   indices: [],
+  userProfile: generateDefaultUserProfile(),
 
   setSymbolName: async (symbol: string, name: string) => {
     if (!name || !name.trim()) return;
@@ -227,22 +252,17 @@ export const useStockStore = create<StockState>((set, get) => ({
   },
   
   updateQuotes: (quotes: Quote[]) => {
-    console.log('[STORE DEBUG] updateQuotes called with:', quotes);
     const quotesMap = quotes.reduce((acc, quote) => {
       acc[quote.symbol] = quote;
       return acc;
     }, {} as Record<string, Quote>);
     
-    set((state) => {
-      const newState = {
-        quotes: {
-          ...state.quotes,
-          ...quotesMap,
-        },
-      };
-      console.log('[STORE DEBUG] New quotes state:', newState.quotes);
-      return newState;
-    });
+    set((state) => ({
+      quotes: {
+        ...state.quotes,
+        ...quotesMap,
+      },
+    }));
   },
   
   loadWatchlist: async () => {
@@ -395,9 +415,27 @@ export const useStockStore = create<StockState>((set, get) => ({
       ) {
         const cache = saved as QuotesCache;
         const isToday = cache.date === getTodayDateString();
-        if (isToday && Object.keys(cache.quotes).length > 0) {
+        const quoteList = Object.values(cache.quotes);
+
+        // 字段完整性校验：旧版本缓存不含 high/low/open/previousClose 字段，
+        // 直接丢弃，触发首次刷新拿到完整字段，避免用户长时间看到 — 占位符。
+        const hasExtendedFields = quoteList.some(
+          (q) =>
+            q &&
+            (q.high !== undefined ||
+              q.low !== undefined ||
+              q.open !== undefined ||
+              q.previousClose !== undefined),
+        );
+
+        if (isToday && quoteList.length > 0 && hasExtendedFields) {
           set({ quotes: cache.quotes });
           return true;
+        }
+
+        // 缓存无效（过期 / 字段不全），主动清掉防止下次再误用
+        if (quoteList.length > 0 && !hasExtendedFields) {
+          await window.electronAPI.setStore('quotesCache', null);
         }
       }
     } catch (error) {
@@ -418,67 +456,155 @@ export const useStockStore = create<StockState>((set, get) => ({
     }
   },
 
-  loadQuestions: async () => {
+  loadConversations: async () => {
     try {
-      const saved = await window.electronAPI.getStore('stockQuestions');
+      const saved = await window.electronAPI.getStore('conversations');
       if (Array.isArray(saved)) {
-        set({ questions: saved as StockQuestion[] });
+        set({ conversations: saved as Conversation[] });
       }
     } catch (error) {
-      console.error('Failed to load questions:', error);
+      console.error('Failed to load conversations:', error);
     }
   },
 
-  addQuestion: async (symbol: string, question: string) => {
-    const newQuestion: StockQuestion = {
+  createConversation: async (symbol?: string) => {
+    const now = new Date().toISOString();
+    const newConversation: Conversation = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      symbol: symbol.toUpperCase(),
-      question: question.trim(),
-      createdAt: new Date().toISOString(),
+      title: '新对话',
+      symbol: symbol ? symbol.toUpperCase() : undefined,
+      messages: [],
+      createdAt: now,
+      updatedAt: now,
     };
-    const updated = [newQuestion, ...get().questions];
-    set({ questions: updated });
+    const updated = [newConversation, ...get().conversations];
+    set({ conversations: updated, activeConversationId: newConversation.id });
     try {
-      await window.electronAPI.setStore('stockQuestions', updated);
+      await window.electronAPI.setStore('conversations', updated);
     } catch (error) {
-      console.error('Failed to save questions:', error);
+      console.error('Failed to save conversations:', error);
+    }
+    return newConversation.id;
+  },
+
+  appendMessage: async (conversationId: string, messageData: Omit<ConversationMessage, 'id' | 'createdAt'>) => {
+    const now = new Date().toISOString();
+    const newMessage: ConversationMessage = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      ...messageData,
+      createdAt: now,
+    };
+
+    const updated = get().conversations.map((conv) => {
+      if (conv.id !== conversationId) return conv;
+
+      const updatedMessages = [...conv.messages, newMessage];
+      // 第一条用户消息作为对话标题
+      const firstUserMessage = updatedMessages.find((m) => m.role === 'user');
+      const title = firstUserMessage
+        ? firstUserMessage.content.slice(0, 20) + (firstUserMessage.content.length > 20 ? '…' : '')
+        : conv.title;
+
+      return { ...conv, messages: updatedMessages, title, updatedAt: now };
+    });
+
+    // 将更新后的 conversation 移到列表最前面（最新活跃在前）
+    const targetIndex = updated.findIndex((c) => c.id === conversationId);
+    if (targetIndex > 0) {
+      const [target] = updated.splice(targetIndex, 1);
+      updated.unshift(target);
+    }
+
+    set({ conversations: updated });
+    try {
+      await window.electronAPI.setStore('conversations', updated);
+    } catch (error) {
+      console.error('Failed to save conversations:', error);
+    }
+    return newMessage;
+  },
+
+  deleteConversation: async (id: string) => {
+    const updated = get().conversations.filter((c) => c.id !== id);
+    const activeId = get().activeConversationId;
+    set({
+      conversations: updated,
+      activeConversationId: activeId === id ? (updated[0]?.id ?? null) : activeId,
+    });
+    try {
+      await window.electronAPI.setStore('conversations', updated);
+    } catch (error) {
+      console.error('Failed to delete conversation:', error);
     }
   },
 
-  deleteQuestion: async (id: string) => {
-    const updated = get().questions.filter((q) => q.id !== id);
-    set({ questions: updated });
+  loadUserProfile: async () => {
     try {
-      await window.electronAPI.setStore('stockQuestions', updated);
+      const saved = await window.electronAPI.getStore('userProfile');
+      if (saved && typeof saved === 'object') {
+        set({ userProfile: saved as UserProfile });
+      } else {
+        // 首次使用：生成随机默认值并持久化
+        const defaultProfile = generateDefaultUserProfile();
+        set({ userProfile: defaultProfile });
+        await window.electronAPI.setStore('userProfile', defaultProfile);
+      }
     } catch (error) {
-      console.error('Failed to delete question:', error);
+      console.error('Failed to load userProfile:', error);
     }
+  },
+
+  saveUserProfile: async (profile: UserProfile) => {
+    set({ userProfile: profile });
+    try {
+      await window.electronAPI.setStore('userProfile', profile);
+    } catch (error) {
+      console.error('Failed to save userProfile:', error);
+    }
+  },
+
+  setActiveConversationId: (id: string | null) => {
+    set({ activeConversationId: id });
   },
 
   fetchIndices: async () => {
     try {
-      console.log('[INDICES DEBUG] fetchIndices: Calling window.electronAPI.getIndices()');
-      const rawJson = await window.electronAPI.getIndices();
-      console.log('[INDICES DEBUG] fetchIndices: Raw JSON response:', rawJson);
-      
-      // 从 rawJson 中提取最后一个完整 JSON 数组（防止 AKShare tqdm 进度条污染 stdout）
-      const jsonMatch = rawJson.match(/(\[[\s\S]*\])\s*$/);
-      const cleanJson = jsonMatch ? jsonMatch[1] : rawJson;
-      console.log('[INDICES DEBUG] fetchIndices: Clean JSON:', cleanJson);
-      
-      const parsed = JSON.parse(cleanJson);
-      console.log('[INDICES DEBUG] fetchIndices: Parsed result:', parsed);
-      console.log('[INDICES DEBUG] fetchIndices: Is array?', Array.isArray(parsed));
-      
+      // ⚠️ 必须走 IPC 让主进程（Node fetch）发起请求：
+      // 渲染进程（Chromium）直接 fetch 东方财富会被 CORS 拦截
+      // （东方财富不返回 Access-Control-Allow-Origin，且 User-Agent / Referer 在浏览器中是 unsafe header）
+      console.log('[fetchIndices] 调用 window.electronAPI.getIndices()');
+      const raw = await window.electronAPI.getIndices();
+      const rawStr = String(raw ?? '');
+      console.log('[fetchIndices] 主进程原始返回（前 500 字符）:', rawStr.slice(0, 500));
+
+      const parsed: unknown = JSON.parse(rawStr);
+
+      // 兼容三种返回形态：
+      //   1. 数组 IndexQuote[]                         （东方财富/Python 正常路径）
+      //   2. { error, message }                        （Python execFile 失败的降级返回）
+      //   3. { indices: IndexQuote[] }                 （历史/兜底封装格式）
+      let result: IndexQuote[] | null = null;
       if (Array.isArray(parsed)) {
-        console.log('[INDICES DEBUG] fetchIndices: Updating indices with', parsed.length, 'items');
-        set({ indices: parsed as IndexQuote[] });
+        result = parsed as IndexQuote[];
+      } else if (parsed && typeof parsed === 'object' && 'indices' in parsed
+                 && Array.isArray((parsed as { indices: unknown }).indices)) {
+        result = (parsed as { indices: IndexQuote[] }).indices;
+      } else if (parsed && typeof parsed === 'object' && 'error' in parsed) {
+        console.warn('[fetchIndices] 主进程返回错误:', parsed);
       } else {
-        console.warn('[INDICES DEBUG] fetchIndices: Parsed result is not an array!', typeof parsed);
+        console.warn('[fetchIndices] 主进程返回未知格式:', parsed);
       }
-    } catch (error) {
+
+      if (result && result.length > 0) {
+        console.log('[fetchIndices] 解析得到', result.length, '个指数:',
+                    result.map((r) => `${r.symbol}=${r.price}`).join(', '));
+        set({ indices: result });
+      } else {
+        console.warn('[fetchIndices] 解析后无有效指数数据，indices 保持不变');
+      }
+    } catch (err) {
       // 静默失败：保留上次数据，不影响主流程
-      console.error('[INDICES DEBUG] fetchIndices: Failed with error:', error);
+      console.error('[fetchIndices] 失败:', err);
     }
   },
 }));

@@ -92,14 +92,50 @@ export interface IndexQuote {
   changePercent: number;
 }
 
-/** 用户在分析页面输入的问题记录 */
-export interface StockQuestion {
-  /** 唯一 ID，格式：timestamp-random */
+/** 对话中的单条消息 */
+export interface ConversationMessage {
+  /** 唯一 ID */
   id: string;
-  /** 关联的股票代码 */
-  symbol: string;
-  /** 用户输入的问题内容 */
-  question: string;
+  /** 消息角色：user = 用户，assistant = AI */
+  role: 'user' | 'assistant';
+  /** 消息内容（Markdown 格式） */
+  content: string;
   /** 创建时间，ISO 8601 格式 */
   createdAt: string;
+}
+
+/** 一次完整的分析对话（包含多轮问答） */
+export interface Conversation {
+  /** 唯一 ID，格式：timestamp-random */
+  id: string;
+  /** 对话标题，自动取第一条用户消息的前 20 字 */
+  title: string;
+  /** 关联的股票代码（可选，用于 StockInfoBar 展示） */
+  symbol?: string;
+  /** 消息列表，按时间正序 */
+  messages: ConversationMessage[];
+  /** 创建时间，ISO 8601 格式 */
+  createdAt: string;
+  /** 最后更新时间，ISO 8601 格式 */
+  updatedAt: string;
+}
+
+/** 用户个人资料（头像 + 用户名） */
+export interface UserProfile {
+  /** 用户名，默认随机生成 */
+  username: string;
+  /** 头像：base64 图片字符串（用户上传）；为空时使用随机 emoji 头像 */
+  avatar?: string;
+  /** emoji 头像（随机分配，无自定义图片时展示） */
+  emojiAvatar: string;
+}
+
+/** @deprecated 使用 Conversation + ConversationMessage 替代 */
+export interface StockQuestion {
+  id: string;
+  symbol: string;
+  question: string;
+  createdAt: string;
+  answer?: string;
+  answeredAt?: string;
 }

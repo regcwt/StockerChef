@@ -30,12 +30,19 @@ export interface ElectronAPI {
    */
   searchCNSymbol: (query: string) => Promise<string>;
   /**
-   * 获取港股实时行情（AKShare stock_hk_spot 新浪财经，支持 XXXXX.HK 格式）
-   * 数据源：ak.stock_hk_spot()，10分钟进程级缓存 + threading.Lock 防并发
+   * 获取港股实时行情（东方财富 push2，secid 格式 90.XXXXX，支持 XXXXX.HK 格式）
+   * 优先东方财富 HTTP API，失败时降级到 Python AKShare stock_hk_spot
    * symbols: 逗号分隔的港股代码，如 "03690.HK,00700.HK"
    * 返回 JSON 字符串：Quote[] 或 { error, message }
    */
   getHKQuote: (symbols: string) => Promise<string>;
+  /**
+   * 获取美股实时行情（东方财富 push2，按 ticker 白名单精准选择 105/106 市场代码）
+   * 优先东方财富 HTTP API，失败时降级到 Python Provider 链（Finnhub → yfinance）
+   * symbols: 逗号分隔的美股代码，如 "AAPL,MSFT,TSLA"
+   * 返回 JSON 字符串：Quote[] 或 { error, message }
+   */
+  getUSQuote: (symbols: string) => Promise<string>;
   /**
    * 获取关键指数行情（上证、科创综指、纳斯达克、标普500、恒生、恒生科技）
    * 数据源：A 股指数 → AKShare stock_zh_index_spot_sina；港美指数 → yfinance
