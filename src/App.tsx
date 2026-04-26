@@ -704,10 +704,16 @@ function App() {
             <Dashboard onStockClick={handleNavigateToAnalysis} onNavigateToSettings={handleNavigateToSettings} />
           </div>
           <div style={{ display: activeTab === 'detail' ? 'block' : 'none' }}>
-            <Analysis initialSymbol={analysisSymbol} />
+            {/* isActive 控制懒加载：仅当用户切到详情 tab 时才发起 K线/报价/新闻请求 */}
+            <Analysis initialSymbol={analysisSymbol} isActive={activeTab === 'detail'} />
           </div>
           <div style={{ display: activeTab === 'chat' ? 'block' : 'none', height: '100%' }}>
-            <Chat activeConversationId={activeConversationId} initialSymbol={analysisSymbol} />
+            {/* isActive 控制懒加载：仅当用户切到 chat tab 时才轮询关联股票的报价 */}
+            <Chat
+              activeConversationId={activeConversationId}
+              initialSymbol={analysisSymbol}
+              isActive={activeTab === 'chat'}
+            />
           </div>
           <div style={{ display: activeTab === 'settings' ? 'block' : 'none', height: 'calc(100vh - 80px)', overflow: 'hidden' }}>
             <Settings />

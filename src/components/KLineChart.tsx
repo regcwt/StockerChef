@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, memo } from 'react';
 import { createChart, ColorType, CandlestickSeries, HistogramSeries } from 'lightweight-charts';
 import type { IChartApi, ISeriesApi } from 'lightweight-charts';
 import type { HistoricalDataPoint } from '@/types';
@@ -10,7 +10,15 @@ interface KLineChartProps {
   height?: number;
 }
 
-const KLineChart = ({ data, isDark = false, height = 380 }: KLineChartProps) => {
+/**
+ * 用 React.memo 包裹防止父组件重渲染（如 5 秒一次的 quote 刷新）
+ * 触发 KLineChart 整个函数体重跑。chart 实例本身在 useEffect 里持久化，
+ * 但 memo 能进一步省掉无意义的 props diff 与 reconciliation。
+ *
+ * data 是 useState 引用稳定的数组，父组件只在切换 symbol / range 时才会改变；
+ * height / isDark 也都是低频变化，shallow compare 足够。
+ */
+const KLineChartImpl = ({ data, isDark = false, height = 380 }: KLineChartProps) => {
   const containerRef = useRef<HTMLDivElement>(null);
   // 持久化 chart 实例，避免每次 data 变化都销毁重建
   const chartRef = useRef<IChartApi | null>(null);
@@ -153,5 +161,7 @@ const KLineChart = ({ data, isDark = false, height = 380 }: KLineChartProps) => 
 
   return <div ref={containerRef} style={{ width: '100%', height }} />;
 };
+
+const KLineChart = memo(KLineChartImpl);
 
 export default KLineChart;

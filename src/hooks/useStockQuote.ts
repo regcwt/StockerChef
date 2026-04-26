@@ -8,7 +8,19 @@ interface UseStockQuoteResult {
   error: string | null;
 }
 
-export const useStockQuote = (symbol: string, interval: number = 10000): UseStockQuoteResult => {
+/**
+ * 单只股票实时报价轮询 hook。
+ *
+ * @param symbol   股票代码（A 股 6 位 / 港股 XXXXX.HK / 美股 ticker）
+ * @param interval 轮询间隔（毫秒，默认 10s）
+ * @param enabled  是否启用（默认 true）。设为 false 时不发请求、不起 interval，
+ *                 用于详情页等"切到对应 tab 才加载"的懒加载场景，避免后台轮询浪费 API 配额
+ */
+export const useStockQuote = (
+  symbol: string,
+  interval: number = 10000,
+  enabled: boolean = true,
+): UseStockQuoteResult => {
   const [quote, setQuote] = useState<Quote | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -65,18 +77,20 @@ export const useStockQuote = (symbol: string, interval: number = 10000): UseStoc
     }
   }, []); // 依赖为空：通过 symbolRef 读取最新值，无需将 symbol 加入依赖
 
-  // symbol 变化时立即重置状态并重新拉取
+  // symbol 变化或 enabled 切换时立即重置状态；enabled=true 时才发起首次拉取
   useEffect(() => {
     setQuote(null);
     setError(null);
+    if (!enabled) return;
     fetchQuote();
-  }, [symbol, fetchQuote]);
+  }, [symbol, enabled, fetchQuote]);
 
-  // interval 变化时重建定时器，fetchQuote 引用稳定不会导致额外重建
+  // interval 或 enabled 变化时重建定时器；enabled=false 时不起 interval
   useEffect(() => {
+    if (!enabled) return;
     const intervalId = setInterval(fetchQuote, interval);
     return () => clearInterval(intervalId);
-  }, [fetchQuote, interval]);
+  }, [fetchQuote, interval, enabled]);
 
   return { quote, loading, error };
 };

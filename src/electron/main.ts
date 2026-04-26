@@ -7,8 +7,12 @@ import {
   fetchCNQuotes,
   fetchHKQuotes,
   fetchUSQuotes,
+  fetchQuotes as fetchEastMoneyQuotes,
   fetchIndices as fetchEastMoneyIndices,
+  fetchEastMoneyNews,
+  fetchCompanyDetail as fetchEastMoneyCompanyDetail,
 } from '../services/eastmoney';
+import { log } from '../utils/logger';
 
 // Disable hardware acceleration to prevent GPU process crashes on macOS
 // This is safe for stock dashboard apps that don't need 3D rendering
@@ -112,7 +116,7 @@ app.whenReady().then(() => {
       const dockIconPath = resolve(__dirname, '../resources/icon.png');
       app.dock.setIcon(dockIconPath);
     } catch (err) {
-      console.warn('[StockerChef] Failed to set dock icon:', err);
+      log.warn('[StockerChef] Failed to set dock icon:', err);
     }
   }
 
@@ -255,7 +259,7 @@ ipcMain.handle('stock-get-cn-quote', (_event, symbols: string): Promise<string> 
     .then((result) => JSON.stringify(result))
     .catch((err) => {
       // 降级：Python Provider 链
-      console.warn('[CN Quote] 东方财富失败，降级到 Python:', err.message);
+      log.warn('[CN Quote] 东方财富失败，降级到 Python:', err.message);
       return new Promise<string>((resolve) => {
         const args = [
           '--action', 'cn_quote',
@@ -291,7 +295,7 @@ ipcMain.handle('stock-get-hk-quote', (_event, symbols: string): Promise<string> 
     .then((result) => JSON.stringify(result))
     .catch((err) => {
       // 降级：Python Provider 链（AKShare stock_hk_spot）
-      console.warn('[HK Quote] 东方财富失败，降级到 Python:', err.message);
+      log.warn('[HK Quote] 东方财富失败，降级到 Python:', err.message);
       return new Promise<string>((resolve) => {
         const args = [
           '--action', 'hk_quote',
@@ -313,7 +317,7 @@ ipcMain.handle('stock-get-us-quote', (_event, symbols: string): Promise<string> 
     .then((result) => JSON.stringify(result))
     .catch((err) => {
       // 降级：Python Provider 链（Finnhub → yfinance）
-      console.warn('[US Quote] 东方财富失败，降级到 Python:', err.message);
+      log.warn('[US Quote] 东方财富失败，降级到 Python:', err.message);
       return new Promise<string>((resolve) => {
         const args = [
           '--action', 'us_quote',
@@ -326,15 +330,37 @@ ipcMain.handle('stock-get-us-quote', (_event, symbols: string): Promise<string> 
     });
 });
 
+// IPC handler for 自选股批量行情（混合市场：A 股 + 港股 + 美股）
+// 走东方财富 push2 HTTP API（主进程 node:https，绕开渲染进程的浏览器 CORS 限制）
+// 一次请求拿到所有市场的行情，无需调用方按市场分组
+// ⚠️ 失败时直接把真实错误（含 cause）回传前端，**不降级到 Python**，与 stock-get-indices 一致
+ipcMain.handle('stock-get-quotes', async (_event, symbols: string): Promise<string> => {
+  const symbolList = symbols.split(',').map((s) => s.trim()).filter(Boolean);
+  log.log('[QUOTES] 收到 stock-get-quotes 请求，symbols:', symbolList.join(','));
+  try {
+    const result = await fetchEastMoneyQuotes(symbolList);
+    log.log('[QUOTES] 东方财富返回', result.length, '/', symbolList.length, '条行情');
+    return JSON.stringify(result);
+  } catch (err) {
+    const cause = (err as { cause?: unknown }).cause;
+    const detail = err instanceof Error
+      ? `${err.name}: ${err.message}${cause ? ` | cause=${cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause)}` : ''}`
+      : String(err);
+    log.error('[QUOTES] 东方财富批量行情请求失败:', detail);
+    if (err instanceof Error && err.stack) log.error(err.stack);
+    return JSON.stringify({ error: 'quotes_fetch_failed', message: detail });
+  }
+});
+
 // IPC handler for 关键指数行情
 // 走东方财富 push2 HTTP API（主进程 node:https，一次请求获取全部 8 个指数）
 // ⚠️ 按需求**不再降级到 Python**：失败直接把真实错误（含 cause）回传前端，便于排查
 ipcMain.handle('stock-get-indices', async (): Promise<string> => {
-  console.log('[INDICES] 收到 stock-get-indices 请求，开始调用东方财富');
+  log.log('[INDICES] 收到 stock-get-indices 请求，开始调用东方财富');
   try {
     const result = await fetchEastMoneyIndices();
-    console.log('[INDICES] 东方财富返回', result.length, '个指数:',
-                result.map((r) => `${r.symbol}=${r.price}`).join(', '));
+    log.log('[INDICES] 东方财富返回', result.length, '个指数:',
+            result.map((r) => `${r.symbol}=${r.price}`).join(', '));
     return JSON.stringify(result);
   } catch (err) {
     // 把根因（含 undici 的 cause）尽量完整地打到主进程日志和前端
@@ -342,9 +368,51 @@ ipcMain.handle('stock-get-indices', async (): Promise<string> => {
     const detail = err instanceof Error
       ? `${err.name}: ${err.message}${cause ? ` | cause=${cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause)}` : ''}`
       : String(err);
-    console.error('[INDICES] 东方财富指数请求失败（不再降级到 Python）:', detail);
-    if (err instanceof Error && err.stack) console.error(err.stack);
+    log.error('[INDICES] 东方财富指数请求失败（不再降级到 Python）:', detail);
+    if (err instanceof Error && err.stack) log.error(err.stack);
     return JSON.stringify({ error: 'indices_fetch_failed', message: detail });
+  }
+});
+
+// IPC handler for 个股资讯（东方财富）
+// 走 search-api-web.eastmoney.com/search/jsonp（JSONP 接口，主进程 node:https 绕开 CORS）
+// 失败时直接把真实错误回传渲染层，由调用方决定是否降级到 Finnhub
+ipcMain.handle('stock-get-news', async (_event, symbol: string): Promise<string> => {
+  log.log('[NEWS] 收到 stock-get-news 请求，symbol:', symbol);
+  try {
+    const items = await fetchEastMoneyNews(symbol);
+    log.log('[NEWS] 东方财富返回', items.length, '条资讯，symbol:', symbol);
+    return JSON.stringify(items);
+  } catch (err) {
+    const cause = (err as { cause?: unknown }).cause;
+    const detail = err instanceof Error
+      ? `${err.name}: ${err.message}${cause ? ` | cause=${cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause)}` : ''}`
+      : String(err);
+    log.error('[NEWS] 东方财富资讯请求失败:', detail);
+    if (err instanceof Error && err.stack) log.error(err.stack);
+    return JSON.stringify({ error: 'news_fetch_failed', message: detail });
+  }
+});
+
+// IPC handler for 公司详情（东方财富 emweb F10 + push2 stock/get 聚合）
+// 走主进程 node:https，绕开渲染进程对 emweb.eastmoney.com 的 CORS 限制
+// 失败时直接把真实错误回传渲染层，由调用方决定如何展示
+ipcMain.handle('stock-get-company-detail', async (_event, symbol: string): Promise<string> => {
+  log.log('[COMPANY_DETAIL] 收到 stock-get-company-detail 请求，symbol:', symbol);
+  try {
+    const detail = await fetchEastMoneyCompanyDetail(symbol);
+    log.log('[COMPANY_DETAIL] 东方财富返回 symbol:', symbol,
+            'companyName:', detail.companyName ?? '-',
+            'market:', detail.market);
+    return JSON.stringify(detail);
+  } catch (err) {
+    const cause = (err as { cause?: unknown }).cause;
+    const detail = err instanceof Error
+      ? `${err.name}: ${err.message}${cause ? ` | cause=${cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause)}` : ''}`
+      : String(err);
+    log.error('[COMPANY_DETAIL] 东方财富公司详情请求失败:', detail);
+    if (err instanceof Error && err.stack) log.error(err.stack);
+    return JSON.stringify({ error: 'company_detail_fetch_failed', message: detail });
   }
 });
 
@@ -370,7 +438,7 @@ ipcMain.handle('stock-get-preset-data', (_event, market: 'cn' | 'hk' | 'us'): st
   const filePath = getPresetStockDataPath(market);
   
   if (!existsSync(filePath)) {
-    console.warn(`[Preset Stocks] ${market} 数据文件不存在: ${filePath}`);
+    log.warn(`[Preset Stocks] ${market} 数据文件不存在: ${filePath}`);
     return JSON.stringify([]);
   }
   
@@ -379,7 +447,7 @@ ipcMain.handle('stock-get-preset-data', (_event, market: 'cn' | 'hk' | 'us'): st
     return data;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error(`[Preset Stocks] 读取 ${market} 数据失败:`, message);
+    log.error(`[Preset Stocks] 读取 ${market} 数据失败:`, message);
     return JSON.stringify([]);
   }
 });

@@ -121,6 +121,39 @@ Finnhub Key 是**可选配置**，Key 缺失时各功能的正确降级行为如
 
 **正确做法**：在调用 Finnhub 函数的 catch 中，先检查 `handleAPIError(err).includes('API Key not configured')`，是则静默处理。
 
+### 3.10 统一日志规范 ⚠️
+
+**禁止**在 `src/` 下任何文件直接使用 `console.log/warn/error/info/debug`，必须改用 `src/utils/logger.ts` 暴露的 `log` 对象。
+
+原因：
+1. 统一时间戳：每条日志自动带上 `[YYYY-MM-DD HH:mm:ss.mmm]` 前缀，便于排查时间序列问题
+2. 统一颜色：渲染进程用 console %c CSS 样式，主进程（Node）用 ANSI 转义码，warn 黄、error 红、info 青、debug 灰
+3. 统一日志级别：开发环境全开（`debug` 起），生产环境默认屏蔽 `debug`/`info`（仅保留 `log`/`warn`/`error`），避免线上日志噪音
+4. 统一可调：通过 `log.setLevel('warn')` 可在运行时调整最低输出级别
+
+**正确做法**：
+
+```typescript
+import { log } from '@/utils/logger';                      // 渲染进程
+// 或
+import { log } from '../utils/logger';                     // 主进程（src/electron/）
+
+log.log('[INDICES] 收到请求');
+log.warn('[CN Quote] 降级:', err.message);
+log.error('Failed to save:', error);
+log.debug('详细的本地调试信息');                            // 仅 dev 输出
+```
+
+**约定**：
+- 保留 `[模块]` 前缀（如 `[EastMoney]`、`[fetchIndices]`），便于按模块过滤
+- 日常打印用 `log.log`；可恢复异常用 `log.warn`；明确错误用 `log.error`；本地调试细节用 `log.debug`
+- **唯一允许直接写 `console.*` 的文件是 `src/utils/logger.ts` 自身**（它是 logger 的实现）
+
+**禁止**：
+- 在 renderer / 主进程里直接 `console.log()`
+- 用 `log.error` 记录正常的业务日志（会让真实错误被淹没）
+- 在生产环境调用 `log.setLevel('debug')`（会暴露内部细节，且产生大量噪音）
+
 ### 3.3 技术分析数据来源说明（已升级为真实计算）
 
 `Analysis.tsx` 中的 RSI(14)、SMA20、SMA50、SMA200 现在基于东方财富 K 线 API（`fetchKLineData()`）的真实历史 K 线数据计算。
@@ -194,6 +227,7 @@ export const darkTheme: ThemeConfig = {
 | `settings-get` | renderer → main | `key: string` | `unknown`（用户设置值） |
 | `settings-set` | renderer → main | `key: string, value: unknown` | `true` |
 | `stock-get-history` | renderer → main | `symbol, startDate, endDate`（内部追加 `--cn-providers`/`--hk-providers`/`--us-providers` + Token 参数） | JSON 字符串 |
+| `stock-get-quotes` | renderer → main | `symbols: string`（逗号分隔，混合市场） | JSON 字符串（`Quote[]`，主进程内调用 `fetchQuotes` 自动派发 secid） |
 | `stock-get-cn-quote` | renderer → main | `symbols: string`（逗号分隔 6 位代码） | JSON 字符串（`Quote[]`） |
 | `stock-search-cn` | renderer → main | `query: string` | JSON 字符串（`SearchResult[]`） |
 | `stock-get-hk-quote` | renderer → main | `symbols: string`（逗号分隔 XXXXX.HK） | JSON 字符串（`Quote[]`） |
@@ -225,6 +259,7 @@ export const darkTheme: ThemeConfig = {
 - `window.electronAPI.getStore(key)` / `window.electronAPI.setStore(key, value)` — watchlist 等通用存储
 - `window.electronAPI.getSettings(key)` / `window.electronAPI.setSettings(key, value)` — 用户设置（Finnhub Key 等）
 - `window.electronAPI.getStockHistory(symbol, startDate, endDate)` — 历史 K 线数据（调用 Python 脚本）
+- `window.electronAPI.getQuotes(symbols)` — **统一批量行情**，A 股 / 港股 / 美股混合传入（逗号分隔），主进程走东方财富 push2 一次返回；首页所有自选股刷新均走此通道，绕开浏览器 CORS（参见 BUG-014）
 - `window.electronAPI.getCNQuote(symbols)` — A 股实时行情（AKShare，逗号分隔代码）
 - `window.electronAPI.searchCNSymbol(query)` — A 股搜索（AKShare 全量数据模糊匹配）
 - `window.electronAPI.getHKQuote(symbols)` — 港股实时行情（AKShare stock_hk_spot，10min 缓存）
@@ -245,7 +280,7 @@ export const darkTheme: ThemeConfig = {
 
 **导出函数**：
 - `getQuote(symbol)` → `Promise<Quote>` — 获取实时报价（需要 Finnhub Key）
-- `getProfile(symbol)` → `Promise<Partial<Stock>>` — 获取公司基本信息（需要 Finnhub Key）
+- `getProfile(symbol)` → `Promise<Partial<Stock>>` — 获取公司基本信息（需要 Finnhub Key，**内置 1 小时缓存 + in-flight 去重**）
 - `getNews(symbol)` → `Promise<NewsItem[]>` — 获取最近 7 天新闻（需要 Finnhub Key）
 - `searchSymbol(query)` → `Promise<SearchResult[]>` — 搜索股票代码（需要 Finnhub Key）
 - `getHistoricalData(symbol, startDate, endDate)` → `Promise<HistoricalDataResult>` — 历史 K 线（AKShare → yfinance 降级，**不需要 Key**）
@@ -253,6 +288,8 @@ export const darkTheme: ThemeConfig = {
 - `apiRequest<T>(fn)` → `Promise<T>` — 限流队列包装器（新增 API 时使用）
 
 **不负责**：数据缓存（由 hooks 层负责）、状态管理（由 store 负责）。
+
+**例外**：`getProfile` 在 service 层内置了模块级缓存（`profileCache: Map<symbol, {data, timestamp}>`，TTL 1 小时）+ in-flight Promise 去重（`inFlightProfileRequests: Map<symbol, Promise>`）。原因：公司基本信息几乎不变，且会被 Analysis 反复触发（每次切换股票 / 切回 detail tab），把缓存放在 service 层比 hook 层更通用——任何调用方都自动受益。这是 service 层"不负责缓存"原则的明确例外，不要照此模式给其他函数加缓存（实时报价、新闻必须是新鲜数据）。
 
 ### `src/store/useStockStore.ts` — 全局状态
 
@@ -277,7 +314,10 @@ export const darkTheme: ThemeConfig = {
 | `userProfile` | `UserProfile` | 用户个人资料（头像 + 用户名） |
 
 **关键 action**：
-- `fetchIndices()` — 调用 `window.electronAPI.getIndices()` 获取指数行情，解析 JSON 后更新 `indices`
+- `initDashboard()` — **首页启动统一入口**，幂等（内部用 `dashboardInitialized` 标记防重，React.StrictMode dev 双调安全）。并行加载 6 项持久化配置（`loadWatchlist` / `loadSymbolNames` / `loadColorMode` / `loadRefreshInterval` / `loadAlertThresholds` / `loadVisibleColumns`），再 `await loadQuotesCache()` 恢复当天缓存，最后 `set({ dashboardInitialized: true })` 触发轮询 useEffect 启动。**不主动拉取首批行情**——由调用方在 init 完成后通过 `refreshDashboardData()` 触发，方便注入价格阈值通知回调
+- `refreshDashboardData(onAfterQuote?)` — 并行执行 `fetchIndices()` + `fetchAllQuotes(onAfterQuote)`，是首屏首次刷新和定时轮询的唯一入口。任意一类失败不阻塞另一类
+- `fetchAllQuotes(onAfterQuote?)` — 自选股批量行情拉取。一次东方财富 push2 请求覆盖 A 股 / 港股 / 美股，内部走 `fetchQuotes` 自动派发 secid。**内置 in-flight 去重**（模块级 `inFlightFetchAllQuotes` 锁，与 `fetchIndices` 同设计），失败通过 `setError` 暴露。逐条回填公司中文名（`setSymbolName`）；东方财富返回空数组视为本轮失败抛出；本轮无数据的 symbol 写占位 quote 防止 UI 永久 loading；price>0 的有效报价快照保存到 electron-store 作为冷启动缓存。`onAfterQuote` 让调用方对每条 quote 做副作用（Dashboard 用来触发价格阈值通知）
+- `fetchIndices()` — 调用 `window.electronAPI.getIndices()` 获取指数行情，解析 JSON 后更新 `indices`。**内置 in-flight 去重**：模块级 `inFlightFetchIndices: Promise<void> | null` 锁保证同时刻只有一个请求在飞，避免 React.StrictMode dev 双调或并发触发导致主进程收到重复 IPC（详见 BUG-013）
 - `loadWatchlist()` / `saveWatchlist()` — 从 electron-store 读写自选股列表
 - `updateWatchlistOrder(newOrder)` — 更新自选股顺序（拖拽排序后调用）
 - `loadQuotesCache()` / `saveQuotesCache()` — 报价缓存快照（冷启动时先展示当天缓存）
@@ -290,11 +330,22 @@ export const darkTheme: ThemeConfig = {
 
 **职责**：对单个 symbol 进行定时轮询（默认 10s），返回最新报价、加载状态和错误信息。
 
-**使用场景**：`Analysis.tsx` 中对当前查看股票的实时报价更新。Dashboard 的批量刷新直接调用 `getQuote()` 而不使用此 hook（原因：批量场景需要并发控制）。
+**签名**：`useStockQuote(symbol: string, interval = 10000, enabled = true)`
+
+**`enabled` 参数**：用于懒加载场景（如 Analysis 页面只在用户切到详情 tab 时才轮询）。
+- `enabled=false`：不发请求、不起 interval，并清空已有 quote / error 状态
+- `enabled=true`：恢复正常拉取与轮询
+- 默认 `true` 保持向后兼容
+
+**使用场景**：`Analysis.tsx` 中对当前查看股票的实时报价更新（传 `isActive && !!symbol`）。Dashboard 的批量刷新直接调用 `fetchQuotes()` 而不使用此 hook（原因：批量场景需要一次性拉混合市场）。
 
 ### `src/hooks/useStockNews.ts` — 新闻 Hook
 
 **职责**：获取指定 symbol 的新闻，内置 5 分钟内存缓存（`newsCache` Map）。
+
+**签名**：`useStockNews(symbol: string, enabled = true)`
+
+**`enabled` 参数**：与 `useStockQuote` 语义一致，禁用时不发请求；启用时若缓存命中（5 min 内），直接复用上次数据。
 
 **注意**：缓存在页面刷新后失效，不持久化。
 
@@ -302,12 +353,19 @@ export const darkTheme: ThemeConfig = {
 
 **职责**：展示自选股列表、搜索添加股票、批量刷新报价（定时 + 手动触发）、展示 8 个关键指数卡片。
 
-**关键行为**：
-- 组件挂载时依次调用 `loadWatchlist()`、`loadSymbolNames()`、`loadColorMode()`、`loadRefreshInterval()`、`loadAlertThresholds()`、`loadVisibleColumns()` 从 electron-store 加载数据
-- 初始化完成后立即调用一次 `fetchIndices()`，之后与 `fetchAllQuotes` 同步触发（同一个 interval）
-- 刷新间隔由用户在 Settings 中配置（`refreshInterval` 字段，默认 300s），不再固定 10s
+**关键行为**（启动流程已重构，所有数据加载逻辑统一收敛到 store）：
+- **启动 useEffect**：mount 时调用一次 `useStockStore.initDashboard()` 完成所有持久化配置加载 + 当天 quotes 缓存恢复。store 内部并行执行 6 个 `loadXxx`，幂等（内部 `dashboardInitialized` 防重，React.StrictMode dev 双调安全）。返回后若 quotes 缓存有命中，UI 转入 `backgroundRefreshing` 状态提示用户数据正在更新
+- **轮询 useEffect**：`dashboardInitialized` 变 true 后启动，立即调用一次 `refreshDashboardData(checkAlertThreshold)`（首屏首批数据），随后按 `refreshInterval` 周期轮询。`refreshDashboardData` 内部并行拉「指数 + 自选股」，互不阻塞
+- **预置股票 useEffect**：mount 时通过 `getPresetStockData('cn'|'hk'|'us')` 加载本地 JSON，仅供搜索框模糊匹配使用，不参与行情刷新链路
+- **价格阈值通知**：通过 `checkAlertThreshold` 回调注入到 `refreshDashboardData` / `fetchAllQuotes`，store 不依赖 `alertThresholds` 实时值。回调内部用 `alertThresholdsRef` 读最新阈值，避免闭包陈旧
+- **手动刷新按钮**：调用同一个 `refreshDashboardData(checkAlertThreshold)`，复用 store 的 in-flight 去重，避免与定时 interval 撞同帧重复发请求
+- 刷新间隔由用户在 Settings 中配置（`refreshInterval` 字段，默认 300s），通过 `refreshIntervalRef` 让 interval 不因频率变化而重建
 - 点击股票卡片触发 `onStockClick(symbol)` prop 回调，由 App.tsx 切换到 Analysis tab
 - 接受 `onNavigateToSettings?: () => void` prop，用于从搜索提示跳转到 Settings tab
+
+**禁止**：
+- 在 Dashboard 内重新实现 `fetchAllQuotes` 或 `fetchIndices` 的本地版本——所有行情拉取必须走 store action，否则会绕过 in-flight 去重导致重复请求（参见 BUG-013）
+- 在 store 的 `fetchAllQuotes` 内硬编码价格阈值检查逻辑——必须通过 `onAfterQuote` 回调注入，保持 store 与 UI 副作用解耦
 
 **指数卡片区域**：
 - 始终渲染 8 个预设指数卡片（`PRESET_INDICES` 数组），数据未到时用 `—` 占位
@@ -339,9 +397,25 @@ const PRESET_INDICES = [
 **关键行为**：
 - 技术分析通过 `fetchKLineData()`（东方财富 K 线接口，渲染进程直接 fetch）获取真实 K 线数据，计算 RSI(14)/SMA20/50/200，在 Modal 中展示
 - 数据来源标注：`[EastMoney]`（真实数据）、`[SIMULATED DATA]`（数据不足时降级为随机模拟）
-- 报价通过 `useStockQuote` hook 每 10s 自动刷新
-- 公司 profile 仅在组件挂载时请求一次
-- 接收 `initialSymbol` prop（由 App.tsx 传入），不再使用 `useParams`
+- 报价通过 `useStockQuote` hook 按 `refreshInterval` 自动刷新
+- 公司 profile 在 symbol 切换 / 进入 tab 时请求一次
+- 接收 `initialSymbol` 和 `isActive` 两个 prop（由 App.tsx 传入），不再使用 `useParams`
+
+**⚠️ 懒加载（重要）**：
+Analysis 通过 `display: none` 隐藏而非卸载，因此必须用 `isActive` prop 显式控制数据加载，否则用户在 dashboard / chat / settings tab 时，详情页会在后台持续轮询浪费 API 配额。
+
+App.tsx 传入：
+```tsx
+<Analysis initialSymbol={analysisSymbol} isActive={activeTab === 'detail'} />
+```
+
+Analysis 内部所有数据获取入口都受 `isActive` 守卫：
+- K 线 useEffect：`if (!symbol || !isActive) return;`
+- profile useEffect：`if (!symbol || !isActive) return;`
+- `useStockQuote(symbol, refreshInterval * 1000, isActive && !!symbol)`
+- `useStockNews(symbol, isActive && !!symbol)`
+
+**禁止**：在 Analysis 中新增数据加载入口时漏掉 `isActive` 守卫；如果未来其他 tab（chat 等）也复用 `useStockQuote`，必须也加上对应的 `enabled` 控制。
 
 ### `src/pages/Chat.tsx` — AI 对话页
 
@@ -390,6 +464,30 @@ const PRESET_INDICES = [
 **导出函数**：`formatPrice`（USD 货币）、`formatPercent`（带符号百分比）、`formatMarketCap`（T/B/M/K 单位）、`formatDate`（本地化日期时间）
 
 **注意**：`formatMarketCap` 接受百万美元单位的输入（与 Finnhub `getProfile()` 返回的 `marketCapitalization` 单位一致），内部乘以 `1_000_000` 后再做 T/B/M/K 换算。此 Bug 已修复。
+
+### `src/utils/logger.ts` — 统一日志工具
+
+**职责**：为主进程和渲染进程提供统一的日志输出能力。每条日志带毫秒级时间戳、按级别带颜色，并支持运行时切换最低输出级别。
+
+**导出**：
+- `log.debug(...)` / `log.info(...)` / `log.log(...)` / `log.warn(...)` / `log.error(...)` — 5 个语义化方法
+- `log.setLevel(level)` — 运行时调整最低输出级别（`'debug' | 'info' | 'log' | 'warn' | 'error' | 'silent'`）
+- `log.getLevel()` — 读取当前级别
+- `log.isDev` — 当前是否处于开发环境（构建期决定，运行时只读）
+
+**默认行为**：
+- 开发环境（Vite `import.meta.env.DEV` 或 `NODE_ENV !== 'production'`）：默认级别 `debug`，全部输出
+- 生产环境：默认级别 `log`，屏蔽 `debug`/`info`
+
+**颜色实现**：
+- 渲染进程：`console.log('%c[ts]', 'color:#ca8a04;font-weight:bold', ...)` 的 CSS 样式
+- 主进程（Node）：ANSI 转义码 `\x1b[33m...\x1b[0m`
+- 通过 `typeof window !== 'undefined' && typeof document !== 'undefined'` 自动判断平台
+
+**关键约束**：
+- 此文件是项目里**唯一允许直接写 `console.*` 的地方**（参见核心约束 §3.10）
+- 不能引入任何 Electron / Node 专属 API，否则渲染进程会报错
+- `import.meta.env.DEV` 通过 `as unknown as { env?: { DEV?: boolean } }` 强转读取，规避 tsconfig 不一定有 `vite/client` 类型声明的问题
 
 ### `src/components/KLineChart.tsx` — K 线图组件
 
@@ -488,18 +586,19 @@ axios → Finnhub API (https://finnhub.io/api/v1)
 
 ─────────────────────────────────────────
 
-Dashboard 初始化 / 定时刷新（与 fetchAllQuotes 同一 interval）
+Dashboard 初始化 / 定时刷新（refreshDashboardData 并行触发）
   │  fetchIndices() / fetchAllQuotes()
   ▼
-window.electronAPI.getIndices() / getCNQuote()  ←── preload.ts contextBridge
+window.electronAPI.getIndices() / getQuotes(symbols)  ←── preload.ts contextBridge
+  │  ⚠️ 自选股批量行情**必须**走 IPC，不能在渲染进程直接 fetch 东方财富 push2，
+  │     否则浏览器 CORS preflight 会让所有请求挂 Failed to fetch（参见 BUG-014）
+  ▼
+IPC: stock-get-indices / stock-get-quotes  ──→  main.ts
   │
   ▼
-IPC: stock-get-indices / stock-get-cn-quote  ──→  main.ts
-  │
-  ▼
-src/services/eastmoney.ts（Node.js fetch，毫秒级，无需 Python）
+src/services/eastmoney.ts（Node.js fetch，毫秒级，无需 Python，无 CORS 限制）
   ├── fetchIndices()：一次请求获取 8 个关键指数（上证/深成/创业板/纳斯达克/标普/道琼斯/恒生/恒生科技）
-  └── fetchCNQuotes()：批量获取 A 股个股实时行情
+  └── fetchQuotes(symbols)：一次请求覆盖 A 股 / 港股 / 美股，按 symbol 自动派发 secid
   │  ⚠️ ut token 自动轮换：rc !== 0 时切换到下一个备用值重试（最多 3 次）
   │  ⚠️ 超时 8s 后抛出异常，触发降级到 Python Provider 链
   ▼
@@ -637,6 +736,111 @@ IPC → main.ts → execFile(python3, main.py)
 - 修改 import 区域前，**必须先用 `sed -n '1,20p'` 或 `head` 确认文件头部的真实内容**，不要依赖 `read_file` 的缓存（工具缓存可能滞后）
 - `old_string` 要包含足够多的上下文（至少 3-4 行），确保在文件中唯一匹配
 - 修改 import 后立即运行 `npx tsc --noEmit` 验证，import 区域破坏会立即产生大量 `Cannot find name` 错误
+
+### BUG-011：Dashboard 首屏指数请求被发了 3 次（已修复）
+
+**现象**：打开应用首屏，DevTools Network 看到 3 个完全相同的 `push2.eastmoney.com/api/qt/ulist.np/get?...secids=1.000001,0.399001,...` 请求（8 个指数 secid 完全一致），加上 1 个个股批量请求和 Analysis 的 Finnhub 请求，首屏共 7+ 个请求。
+
+**根因**：3 次指数请求来自三处叠加：
+1. `Dashboard.tsx` 的 `initDashboard` 末尾**直接**调用 `useStockStore.getState().fetchIndices()` —— 1 次
+2. 指数独立 useEffect mount 时立刻执行 `fetchIndices()` —— 1 次
+3. `main.tsx` 启用了 `<React.StrictMode>`，**dev 模式下 useEffect 会被故意双调用**用于检测副作用 —— 重放 1 次
+
+#1 的注释里写"避免下个 render 周期才执行"，但 useEffect 在 mount commit 后会同步触发，与直接调用没有可感知的延迟差异，#1 完全冗余。
+
+**修复**：删除 `Dashboard.tsx` `initDashboard` 末尾的 `useStockStore.getState().fetchIndices()`，让指数 useEffect 独自负责首次加载。
+
+**规避原则**：
+- 数据加载入口只保留一处（要么直接调用，要么 useEffect），不要"为了保险再调一次"
+- 评估请求次数时要把 React.StrictMode dev 双调考虑进去；StrictMode 的双调只在 dev 出现，生产构建不会重放
+- 如果一个状态既由 effect 触发又由直调触发，必须用 ref / 标志位去重
+
+### BUG-012：详情页未懒加载，切到其他 tab 仍在后台轮询（已修复）
+
+**现象**：App.tsx 用 `display: none` 隐藏非活跃页面而非卸载，导致用户在 dashboard / chat / settings tab 时，Analysis 仍然每 `refreshInterval` 秒发一次报价（Finnhub `quote?symbol=...`、东方财富 push2）+ 新闻 + profile + K 线请求，浪费 Finnhub 60 次/分钟 配额。
+
+**根因**：Analysis 之前完全靠 `symbol` 做守卫，没有感知到自己是不是当前激活的 tab。`useStockQuote` / `useStockNews` 也没有外部禁用开关。
+
+**修复**：
+- `useStockQuote(symbol, interval, enabled = true)` 新增第三个 `enabled` 参数：禁用时不发请求、不起 interval，且清空已有 quote / error
+- `useStockNews(symbol, enabled = true)` 同上
+- Analysis 接收 `isActive?: boolean = true` prop，K 线和 profile 的 useEffect 守卫加 `&& isActive`，hook 调用传入 `isActive && !!symbol`
+- App.tsx 传 `isActive={activeTab === 'detail'}`
+
+**规避原则**：
+- 当组件用 `display: none` 隐藏（而非卸载）时，必须给所有"轮询 / 周期性请求 / 大流量请求"的 hook 提供外部禁用开关，并由父组件按 `activeTab` 显式控制
+- 新增轮询 hook 时默认提供 `enabled` 参数，且默认值 `true` 保持向后兼容
+- Analysis 内部新增数据加载入口（如未来加财务数据 tab）必须同步加 `isActive` 守卫
+
+### BUG-013：React.StrictMode 导致主进程在 ~40ms 内收到两次 stock-get-indices IPC（已修复）
+
+**现象**：dev 模式下，主进程日志显示同一个 IPC 通道在极短时间内被调用两次：
+
+```
+[2026-04-26 16:36:45.262] [INDICES] 收到 stock-get-indices 请求，开始调用东方财富
+[2026-04-26 16:36:45.303] [INDICES] 收到 stock-get-indices 请求，开始调用东方财富
+```
+
+间隔 41ms，几乎同时打到东方财富，造成无意义的双倍请求。
+
+**根因**：BUG-011 修掉了渲染层"直调 + useEffect"双入口，但只解决了 useEffect 内的一份重复。React.StrictMode 在 dev 模式下会主动 mount → unmount → 再 mount 组件，从而让指数 useEffect 重新执行一次。前一次 fetchIndices 还在等待 IPC 返回时，第二次 fetchIndices 已经被触发，主进程因此收到了 2 次 `stock-get-indices`。这是 dev 模式特有现象，生产构建不会出现，但 dev 期间也会浪费东方财富配额、污染日志。
+
+**修复**：在 `useStockStore.ts` 加一个模块级 in-flight Promise 锁：
+
+```typescript
+let inFlightFetchIndices: Promise<void> | null = null;
+
+fetchIndices: async () => {
+  if (inFlightFetchIndices) {
+    return inFlightFetchIndices;   // 复用还没结束的同一个 Promise
+  }
+  const task = (async () => {
+    try { /* fetch + setState */ }
+    finally { inFlightFetchIndices = null; }   // 完成后释放
+  })();
+  inFlightFetchIndices = task;
+  return task;
+};
+```
+
+效果：同一时刻只发一次 IPC；前一次完成后下次调用照常发起，不影响轮询节奏。
+
+**同步修复 `getProfile`**：Analysis 切换股票 / 切回 detail tab 也存在并发触发风险。在 `stockApi.ts` 给 `getProfile` 加了：
+- 模块级 1 小时缓存（`profileCache: Map<symbol, {data, timestamp}>`），命中直接返回
+- in-flight Promise 去重（`inFlightProfileRequests: Map<symbol, Promise>`），同 symbol 并发调用复用同一 Promise
+
+**同步修复 `fetchAllQuotes`**：Dashboard 个股批量行情同样存在 StrictMode 双调和"手动刷新 + 定时 interval 撞同帧"的并发风险。最初的修复是在 `Dashboard.tsx` 加了模块级 `inFlightFetchAllQuotes: Promise<void> | null` 锁，逻辑与 fetchIndices 完全一致。**后续重构**：`fetchAllQuotes` 已整体搬迁到 `useStockStore.ts` 成为 store action，in-flight 锁也随之搬到 store，与 `fetchIndices` 在同一文件、同一模式，避免 in-flight 锁分散在多文件维护。Dashboard 仅作为调用方，通过 `useStockStore.refreshDashboardData()` 统一触发。
+
+**规避原则**：
+- 任何"由 useEffect 触发 + 可能被并发触发 + 后端代价高"的请求，service / store 层都应有 in-flight 去重，**不要依赖渲染层不出现重复**
+- React.StrictMode 在 dev 双调 useEffect 是设计行为，**不要尝试关掉 StrictMode 来回避**，应该在数据层做幂等处理（生产构建也会受益于幂等设计）
+- 写 in-flight 锁时务必在 `finally` 释放，否则一次失败会导致后续永远拿到同一个 reject 的 Promise
+- 模块级 `let` 变量如果被 store / class 内部引用，**必须声明在引用方之前**，否则 TS 严格模式会报 `Cannot find name`
+
+### BUG-014：渲染进程直接 fetch 东方财富导致 CORS 挂死，自选股全部 `Failed to fetch`（已修复）
+
+**现象**：首页打开后指数卡片正常出价，但所有自选股（A 股 / 港股 / 美股）一律红字 `所有备用 ut 均已尝试，东方财富接口不可用: Failed to fetch`。Network 面板看到对 `push2.eastmoney.com/api/qt/ulist.np/get?...` 的请求 `(failed) net::ERR_FAILED`，Console 报 `Access to fetch at 'https://push2.eastmoney.com/...' from origin 'http://localhost:5173' has been blocked by CORS policy: No 'Access-Control-Allow-Origin' header is present on the requested resource.`
+
+**根因**：之前架构是「指数走 IPC 主进程 + 自选股走渲染进程直接 fetch」。
+- 指数：`fetchIndices()` 在 `ipcMain.handle('stock-get-indices')` 里跑，使用的是 Node fetch，**没有 CORS 限制**，正常返回。
+- 自选股：`fetchAllQuotes()` 早期版本在渲染进程里直接调 `fetchQuotes()`，浏览器 fetch 受同源策略约束，对 `push2.eastmoney.com` 的请求会先发 CORS preflight，东方财富接口未配置允许跨域，preflight 失败 → 整个 fetch reject 为 `TypeError: Failed to fetch`。eastmoney.ts 里的 ut token 轮换逻辑会把 3 个 token 轮一遍，每次都因相同的 CORS 错误失败，最终抛 `所有备用 ut 均已尝试`。
+- 这个差异在 dev 模式下尤其明显（`http://localhost:5173` origin），打包后 `file://` 协议下行为也不可靠。
+
+**修复**：把自选股批量行情链路也搬到主进程，与指数同模式：
+- `src/electron/main.ts` 新增 `ipcMain.handle('stock-get-quotes', async (_e, symbols: string) => fetchQuotes(symbols.split(',')))`
+- `src/electron/preload.ts` 通过 `contextBridge` 暴露 `getQuotes(symbols: string)`
+- `src/types/electron.d.ts` 同步类型声明
+- `src/store/useStockStore.ts` 在 `fetchAllQuotes` 内部新增 `fetchQuotesViaIPC(symbols)`，所有自选股拉取改走 `window.electronAPI.getQuotes(...)`，不再 `import { fetchQuotes } from '@/services/eastmoney'` 在渲染进程直调
+- `src/pages/Dashboard.tsx` 单股手动刷新 `fetchSingleQuote` 也改走 IPC
+
+**规避原则**：
+- **任何第三方行情 / 数据 HTTP 接口都默认走主进程 IPC**，渲染进程禁止 `fetch('https://...第三方域名')`，因为：
+  1. 几乎所有金融数据接口都不会给 web 端配置 CORS（只对自家网站白名单）
+  2. dev 的 `http://localhost` 与 prod 的 `file://` 表现不一致，渲染进程跑成功不代表打包后能跑
+  3. 主进程没有同源策略，且方便统一加超时 / 重试 / 限流
+- 仅当接口明确返回 `Access-Control-Allow-Origin: *`（如 GitHub API、部分公共数据 API）时，才允许在渲染进程直 fetch
+- K 线 `fetchKLineData()` 当前仍在渲染进程跑，是历史遗留；如果未来 push2his 接口也开始报 CORS（或要打包到 prod 后），按本规约同样搬迁到主进程
+- service 层的 fetch 函数（`eastmoney.ts` 的 `fetchQuotes` / `fetchIndices`）应**只被主进程引用**，不要在 renderer 侧任何文件里 `import` 它们
 
 ### BUG-005：`app.dock.setIcon()` 和 `execFile` 抛出未捕获异常导致 UnhandledPromiseRejection
 
@@ -800,6 +1004,10 @@ grep -r "from 'electron'" src/ --include="*.ts" --include="*.tsx" | grep -v "src
 grep "ipcMain.handle" src/electron/main.ts
 grep "electronAPI" src/types/electron.d.ts
 # 手动对比：main.ts 中每个 handle 的通道，preload.ts 和 electron.d.ts 中都应有对应声明
+
+# 检查是否有绕过统一 logger 直接写 console.* 的代码（参见核心约束 §3.10）
+grep -rE "console\.(log|warn|error|info|debug)" src/ --include="*.ts" --include="*.tsx" | grep -v "src/utils/logger.ts"
+# 期望：无输出（除 logger.ts 自身实现外，所有日志必须走 log.*）
 ```
 
 ### 推理型验证（修改后自查）
@@ -814,6 +1022,10 @@ grep "electronAPI" src/types/electron.d.ts
 - [ ] 调用 AKShare 的 Python 函数，是否在调用前将 `sys.stdout` 重定向到 `sys.stderr`（防止 tqdm 污染 JSON 输出）？
 - [ ] 使用 lightweight-charts v5 的时间格式化回调（`tickMarkFormatter`、`localization.timeFormatter`）时，是否按 `BusinessDay` 对象 `{ year, month, day }` 解构，而非当作数字或字符串处理？
 - [ ] Dashboard 的指数卡片顺序是否与 `PRESET_INDICES` 数组一致（上证→深成→创业板→纳斯达克→标普→道琼斯→恒生→恒生科技）？
+- [ ] 同一份数据是否存在「直接调用 + useEffect 自动触发」的双入口？（应该只保留 useEffect 一处，避免 StrictMode 下的 N+1 重复请求）
+- [ ] 在 Analysis 等用 `display:none` 隐藏的页面里新增数据加载入口时，是否加了 `isActive` 守卫？传入的 hook 是否带了 `enabled` 参数？
+- [ ] 新增的"由 useEffect 触发 + 后端代价高"的请求是否在 service / store 层加了 in-flight Promise 去重？（在 dev 模式下 React.StrictMode 会双调 useEffect）
+- [ ] 添加模块级 `let` 变量给 store / class 内部引用时，是否将声明放在引用方之前？（避免 TS `Cannot find name`）
 
 ---
 

@@ -12,6 +12,15 @@ interface ChatProps {
   activeConversationId: string | null;
   /** 新建对话时的默认股票代码 */
   initialSymbol?: string;
+  /**
+   * 当前页面是否处于激活状态（即用户切到了 chat tab）。
+   * 由 App.tsx 传入 `activeTab === 'chat'`。
+   *
+   * 懒加载语义：与 Analysis 页一致，`isActive=false` 时不轮询关联股票的报价，
+   * 避免用户在 dashboard / detail / settings tab 时 Chat 仍在后台浪费 API 配额。
+   * 默认 true 以保持向后兼容。
+   */
+  isActive?: boolean;
 }
 
 /** 用户消息气泡（右侧，灰色背景，带头像 + 用户名 + 时间） */
@@ -510,7 +519,7 @@ const ChatInputBar = ({
   </div>
 );
 
-const Chat = ({ activeConversationId, initialSymbol }: ChatProps) => {
+const Chat = ({ activeConversationId, initialSymbol, isActive = true }: ChatProps) => {
   const {
     conversations,
     activeConversationId: storeActiveId,
@@ -546,9 +555,11 @@ const Chat = ({ activeConversationId, initialSymbol }: ChatProps) => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
+  // 懒加载：仅当用户切到 chat tab 且当前对话有关联股票时才轮询报价
   const { quote, loading: quoteLoading, error: quoteError } = useStockQuote(
     symbol,
     refreshInterval * 1000,
+    isActive && !!symbol,
   );
 
   const { up: upColor, down: downColor } = getChangeColors(colorMode);

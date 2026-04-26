@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { fetchQuotes } from '@/services/eastmoney';
+import type { StockQuoteResult } from '@/services/eastmoney';
 import { Input, Button, Spin, Alert, Typography, Space, Tag, Modal, InputNumber, Switch, Tooltip } from 'antd';
 import {
   SearchOutlined,
@@ -14,6 +14,9 @@ import {
   MenuOutlined,
   UpOutlined,
   DownOutlined,
+  ArrowUpOutlined,
+  ArrowDownOutlined,
+  SwapOutlined,
 } from '@ant-design/icons';
 import { DndContext, closestCenter, PointerSensor, useSensor, useSensors } from '@dnd-kit/core';
 import {
@@ -27,6 +30,7 @@ import type { AlertThreshold, ColumnKey } from '@/store/useStockStore';
 import { searchSymbol, handleAPIError, isCNStock, isHKStock, searchCNSymbol } from '@/services/stockApi';
 import type { SearchResult, Quote } from '@/types';
 import { formatPercent, formatPriceByMarket } from '@/utils/format';
+import { log } from '@/utils/logger';
 
 const { Title, Text } = Typography;
 
@@ -51,6 +55,29 @@ function CurrentDateTime() {
         {timeStr}
       </Text>
     </div>
+  );
+}
+
+/**
+ * 数据最后刷新时间指示器：展示绝对时间，格式 "YYYY-MM-DD HH:mm:ss"。
+ * 由于展示的是固定时刻而非相对时长，无需 tick 自驱；只在 lastRefreshAt 变化时重渲染。
+ * 未刷新过时显示 "等待首次刷新..."。
+ */
+function LastRefreshIndicator({ lastRefreshAt }: { lastRefreshAt: number | null }) {
+  if (lastRefreshAt == null) {
+    return <span style={{ color: '#8a9cc8' }}>等待首次刷新...</span>;
+  }
+
+  const d = new Date(lastRefreshAt);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const formatted =
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+    `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+
+  return (
+    <span style={{ fontVariantNumeric: 'tabular-nums' }}>
+      最后刷新：{formatted}
+    </span>
   );
 }
 
@@ -103,13 +130,16 @@ const isChangeColumn = (key: ColumnKey): boolean =>
   key === 'change' || key === 'changePercent';
 
 // 可排序的股票行组件
-const SortableItem = ({ symbol, onStockClick, children }: {
+const SortableItem = ({ symbol, onStockClick, sortDisabled, children }: {
   symbol: string;
   onStockClick: (symbol: string) => void;
+  /** 为 true 时禁用拖拽（涨跌幅排序激活时使用，避免拖拽与排序冲突） */
+  sortDisabled?: boolean;
   children: React.ReactNode;
 }) => {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: symbol,
+    disabled: sortDisabled,
   });
 
   const style = {
@@ -118,12 +148,14 @@ const SortableItem = ({ symbol, onStockClick, children }: {
     opacity: isDragging ? 0.5 : 1,
   };
 
+  // 拖拽禁用时不展开 listeners / attributes，避免触发 dnd-kit 的拖拽行为；
+  // 同时让点击事件正常冒泡到内层 .stock-row 触发 onStockClick
   return (
     <div
       ref={setNodeRef}
       style={style}
-      {...attributes}
-      {...listeners}
+      {...(sortDisabled ? {} : attributes)}
+      {...(sortDisabled ? {} : listeners)}
     >
       <div
         onClick={() => onStockClick(symbol)}
@@ -152,11 +184,24 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
   const {
     watchlist, quotes, symbolNames, error, rateLimited,
     setRateLimited, setError, colorMode, refreshInterval,
-    alertThresholds, visibleColumns, indices, fetchIndices,
+    alertThresholds, visibleColumns, indices,
+    dashboardInitialized, initDashboard, refreshDashboardData,
+    lastRefreshAt,
   } = useStockStore();
 
   // 过滤状态：全部、A股、港股、美股
   const [filter, setFilter] = useState<'all' | 'cn' | 'hk' | 'us'>('all');
+
+  // 涨跌幅排序状态：none=不排序（按 watchlist 原顺序）、desc=从大到小、asc=从小到大
+  // 仅会话内有效，不持久化；与拖拽排序互斥（仅 none 时允许拖拽）
+  const [changePercentSort, setChangePercentSort] = useState<'none' | 'desc' | 'asc'>('none');
+
+  /** 三态切换：none → desc → asc → none */
+  const toggleChangePercentSort = () => {
+    setChangePercentSort((prev) =>
+      prev === 'none' ? 'desc' : prev === 'desc' ? 'asc' : 'none'
+    );
+  };
 
   // 传感器配置
   const sensors = useSensors(
@@ -209,13 +254,35 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
   };
 
   // 根据过滤条件过滤股票（useMemo 避免每次渲染都重新遍历）
-  const filteredWatchlist = useMemo(() => watchlist.filter(symbol => {
-    if (filter === 'all') return true;
-    if (filter === 'cn') return isCNStock(symbol);
-    if (filter === 'hk') return isHKStock(symbol);
-    if (filter === 'us') return !isCNStock(symbol) && !isHKStock(symbol);
-    return true;
-  }), [watchlist, filter]);
+  const filteredWatchlist = useMemo(() => {
+    const filtered = watchlist.filter((symbol) => {
+      if (filter === 'all') return true;
+      if (filter === 'cn') return isCNStock(symbol);
+      if (filter === 'hk') return isHKStock(symbol);
+      if (filter === 'us') return !isCNStock(symbol) && !isHKStock(symbol);
+      return true;
+    });
+
+    // 不排序时直接返回（保持 watchlist 原顺序，拖拽生效）
+    if (changePercentSort === 'none') return filtered;
+
+    // 按涨跌幅排序：占位 quote（无数据）一律沉底，避免穿插到有效数据中间
+    const getChangePct = (symbol: string): number | null => {
+      const q = quotes[symbol];
+      if (!q || isPlaceholderQuote(q)) return null;
+      return q.changePercent;
+    };
+
+    return [...filtered].sort((a, b) => {
+      const va = getChangePct(a);
+      const vb = getChangePct(b);
+      // 无数据的排在末尾
+      if (va === null && vb === null) return 0;
+      if (va === null) return 1;
+      if (vb === null) return -1;
+      return changePercentSort === 'desc' ? vb - va : va - vb;
+    });
+  }, [watchlist, filter, changePercentSort, quotes]);
 
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
@@ -248,7 +315,7 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
           us: JSON.parse(usData),
         });
       } catch (err) {
-        console.error('[Preset Stocks] 加载失败:', err);
+        log.error('[Preset Stocks] 加载失败:', err);
       }
     };
     loadPresetData();
@@ -261,38 +328,17 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
   // 记录已触发过的提醒，避免同一条件重复通知（key: symbol-type）
   const triggeredAlertsRef = useRef<Set<string>>(new Set());
 
-  // init 完成标记：用 state 而非 ref，确保 interval useEffect 能感知到变化并重新执行
-  const [initialized, setInitialized] = useState(false);
+  /**
+   * 价格阈值通知检查。仅在 fetchAllQuotes 拿到新报价后被回调一次/条。
+   *
+   * 用 ref 读 alertThresholds，避免回调本身把 alertThresholds 闭包进 store action
+   * 后无法感知用户在运行时新增/修改阈值。
+   */
+  const alertThresholdsRef = useRef(alertThresholds);
+  useEffect(() => { alertThresholdsRef.current = alertThresholds; }, [alertThresholds]);
 
-  useEffect(() => {
-    const initDashboard = async () => {
-      await useStockStore.getState().loadWatchlist();
-      await useStockStore.getState().loadSymbolNames();
-      await useStockStore.getState().loadColorMode();
-      await useStockStore.getState().loadRefreshInterval();
-      await useStockStore.getState().loadAlertThresholds();
-      await useStockStore.getState().loadVisibleColumns();
-
-      // 先加载当天缓存展示，同时触发后台刷新
-      const hasTodayCache = await useStockStore.getState().loadQuotesCache();
-      if (hasTodayCache) {
-        setBackgroundRefreshing(true);
-      }
-
-      // init 完成，触发 interval useEffect 启动
-      setInitialized(true);
-
-      // 指数数据不依赖 watchlist，在 init 完成后立即触发首次加载
-      // 原因：useEffect 的 initialized 守卫会在下一个 render 周期才执行，
-      // 而 initDashboard 里直接调用可以确保首次加载立即发起
-      useStockStore.getState().fetchIndices();
-    };
-    initDashboard();
-  }, []);
-
-  /** 检查单只股票的报价是否触发阈值，触发则发送系统通知 */
-  const checkAlertThreshold = (symbol: string, quote: Quote) => {
-    const threshold = alertThresholds[symbol];
+  const checkAlertThreshold = useCallback((quote: Quote) => {
+    const threshold = alertThresholdsRef.current[quote.symbol];
     if (!threshold || !threshold.enabled) return;
 
     const { priceAbove, priceBelow, changeAbove, changeBelow } = threshold;
@@ -307,118 +353,57 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
     };
 
     if (priceAbove !== undefined && price >= priceAbove) {
-      notify(`${symbol}-priceAbove`, `📈 ${symbol} 价格提醒`, `当前价格 ${price.toFixed(2)} 已超过设定上限 ${priceAbove}`);
+      notify(`${quote.symbol}-priceAbove`, `📈 ${quote.symbol} 价格提醒`, `当前价格 ${price.toFixed(2)} 已超过设定上限 ${priceAbove}`);
     }
     if (priceBelow !== undefined && price <= priceBelow) {
-      notify(`${symbol}-priceBelow`, `📉 ${symbol} 价格提醒`, `当前价格 ${price.toFixed(2)} 已低于设定下限 ${priceBelow}`);
+      notify(`${quote.symbol}-priceBelow`, `📉 ${quote.symbol} 价格提醒`, `当前价格 ${price.toFixed(2)} 已低于设定下限 ${priceBelow}`);
     }
     if (changePct >= changeAbove) {
-      notify(`${symbol}-changeAbove`, `🚀 ${symbol} 涨幅提醒`, `今日涨幅 +${changePct.toFixed(2)}% 已超过设定上限 +${changeAbove}%`);
+      notify(`${quote.symbol}-changeAbove`, `🚀 ${quote.symbol} 涨幅提醒`, `今日涨幅 +${changePct.toFixed(2)}% 已超过设定上限 +${changeAbove}%`);
     }
     if (changePct <= changeBelow) {
-      notify(`${symbol}-changeBelow`, `⚠️ ${symbol} 跌幅提醒`, `今日跌幅 ${changePct.toFixed(2)}% 已超过设定下限 ${changeBelow}%`);
+      notify(`${quote.symbol}-changeBelow`, `⚠️ ${quote.symbol} 跌幅提醒`, `今日跌幅 ${changePct.toFixed(2)}% 已超过设定下限 ${changeBelow}%`);
     }
-  };
+  }, []);
 
-  // 用 ref 存储最新的 watchlist 和 alertThresholds，避免 fetchAllQuotes 捕获旧闭包
-  // 这样 setInterval 的回调始终能读到最新值，无需每次 watchlist 变化都重建 interval
-  const watchlistRef = useRef(watchlist);
-  const alertThresholdsRef = useRef(alertThresholds);
-  useEffect(() => { watchlistRef.current = watchlist; }, [watchlist]);
-  useEffect(() => { alertThresholdsRef.current = alertThresholds; }, [alertThresholds]);
-
-  const fetchAllQuotes = useCallback(async () => {
-    const currentWatchlist = watchlistRef.current;
-    if (currentWatchlist.length === 0) return;
-    setError(null);
-    try {
-      // 统一一次东方财富 push2 请求拿全部行情，无需按 A 股 / 港股 / 美股分组
-      // fetchQuotes 内部会按 symbol 自动派发到对应市场代码（0./1./116./105./106.）
-      let validQuotes: Quote[] = [];
-      try {
-        const results = await fetchQuotes(currentWatchlist);
-        // 顺便保存公司名称（东方财富行情数据里有 name 字段）
-        results.forEach((item) => {
-          if (item.symbol && item.name && item.name !== item.symbol) {
-            useStockStore.getState().setSymbolName(item.symbol, item.name);
-          }
-        });
-        validQuotes = results.map((item): Quote => ({
-          symbol: item.symbol,
-          price: item.price,
-          change: item.change,
-          changePercent: item.changePercent,
-          high: item.high,
-          low: item.low,
-          open: item.open,
-          previousClose: item.previousClose,
-          volume: item.volume,
-          timestamp: new Date().toISOString(),
-        }));
-      } catch {
-        // 东方财富不可用时静默跳过，下方占位逻辑会接管
-      }
-
-      useStockStore.getState().updateQuotes(validQuotes);
-      validQuotes.forEach((quote) => checkAlertThreshold(quote.symbol, quote));
-
-      // 持久化有效报价到 electron-store（仅缓存 price > 0 的真实数据，避免占位 quote 污染缓存）
-      // 下次启动时 loadQuotesCache() 会恢复，A 股/港股无需等待 Python 脚本重新加载
-      if (validQuotes.some((q) => q.price > 0)) {
-        useStockStore.getState().saveQuotesCache();
-      }
-
-      // 对本次刷新后仍无数据的 symbol 写入空占位 quote，避免 UI 无限 loading
-      // 场景：港股 yfinance 限流、A 股 AKShare 不可用、Finnhub Key 缺失等
-      const fetchedSymbols = new Set(validQuotes.map((q) => q.symbol));
-      const currentQuotes = useStockStore.getState().quotes;
-      const placeholderQuotes: Quote[] = currentWatchlist
-        .filter((s) => !fetchedSymbols.has(s) && currentQuotes[s] === undefined)
-        .map((s): Quote => ({
-          symbol: s,
-          price: 0,
-          change: 0,
-          changePercent: 0,
-          timestamp: new Date().toISOString(),
-        }));
-      if (placeholderQuotes.length > 0) {
-        useStockStore.getState().updateQuotes(placeholderQuotes);
-      }
-    } catch (err: any) {
-      setError(handleAPIError(err));
-    } finally {
-      setBackgroundRefreshing(false);
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [setError, setRateLimited]);
-
-  // refreshInterval ref，避免 interval useEffect 因 refreshInterval 变化而重建
+  // refreshInterval ref：让轮询 useEffect 不需要因 refreshInterval 变化而重建 interval
   const refreshIntervalRef = useRef(refreshInterval);
   useEffect(() => { refreshIntervalRef.current = refreshInterval; }, [refreshInterval]);
 
+  // ── 启动 useEffect：mount 时调用 store.initDashboard() 完成首屏所有持久化配置加载 ──
+  // initDashboard 内部已并行加载 watchlist / symbolNames / colorMode / refreshInterval /
+  // alertThresholds / visibleColumns，并恢复当天 quotes 缓存。
+  // store 内部用 dashboardInitialized 标记防重，React.StrictMode 双调也安全。
   useEffect(() => {
-    // 守卫：init 未完成时不启动刷新
-    // 原因：initDashboard 异步加载 watchlist/refreshInterval 时，每次 store 状态变化都会触发本 useEffect
-    // 加守卫后，只有 init 完成（initialized=true）后才会真正启动刷新和 interval
-    if (!initialized) return;
-    fetchAllQuotes();
-    // 用动态 interval：每次 tick 时读取最新的 refreshInterval，避免 interval 因 refreshInterval 变化重建
-    const intervalId = setInterval(() => fetchAllQuotes(), refreshIntervalRef.current * 1000);
-    return () => clearInterval(intervalId);
-  // fetchAllQuotes 是 useCallback，依赖稳定；watchlist 变化通过 watchlistRef 感知，无需加入依赖
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialized, fetchAllQuotes]);
-
-  // 指数刷新独立 useEffect：组件挂载时立即拉取一次，之后按 refreshInterval 轮询
-  // 原因：指数是预设固定列表，与 watchlist / refreshInterval 等异步加载状态无关，
-  //       无需等 initDashboard 完成；启动时必须立刻有数据，避免首屏长时间 `—` 占位
-  useEffect(() => {
-    fetchIndices();
-    const intervalId = setInterval(() => fetchIndices(), refreshIntervalRef.current * 1000);
-    return () => clearInterval(intervalId);
-  // 仅在挂载时执行；fetchIndices 是 zustand 稳定引用，refreshIntervalRef 通过 ref 读最新值
+    initDashboard().then(() => {
+      // 若有当天缓存恢复出来，UI 转入"后台刷新"状态以提示用户数据正在更新
+      // （loadQuotesCache 已在 initDashboard 内执行；此处用 quotes 是否非空近似判断缓存命中）
+      if (Object.keys(useStockStore.getState().quotes).length > 0) {
+        setBackgroundRefreshing(true);
+      }
+    });
+  // initDashboard 是 store 内稳定引用，无需作为依赖
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // ── 轮询 useEffect：init 完成后立即触发首批刷新，再按 refreshInterval 周期轮询 ──
+  // refreshDashboardData 内部并行拉取「指数 + 自选股」两类数据，互不阻塞。
+  // 把价格阈值通知作为回调注入，让 store 不依赖 UI 层的具体副作用。
+  useEffect(() => {
+    if (!dashboardInitialized) return;
+
+    const tick = () => {
+      refreshDashboardData(checkAlertThreshold).finally(() => {
+        setBackgroundRefreshing(false);
+      });
+    };
+
+    tick(); // 首次立即拉
+    const intervalId = setInterval(tick, refreshIntervalRef.current * 1000);
+    return () => clearInterval(intervalId);
+  // refreshDashboardData / checkAlertThreshold 都是稳定引用；refreshInterval 通过 ref 读最新值
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dashboardInitialized]);
 
   const handleSearch = async (query: string) => {
     setSearchQuery(query);
@@ -557,13 +542,15 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
 
   /**
    * 添加新股票后立即获取该股票的最新报价，不等待下一个 interval 周期。
-   * 统一走 fetchQuotes，内部自动按 symbol 推断市场代码（A 股 / 港股 / 美股），
-   * 调用方无需关心 symbol 属于哪个市场。
+   * 走 IPC（stock-get-quotes）→ 主进程 node:https 调东方财富，绕开渲染进程 CORS 限制。
+   * 主进程内部按 symbol 自动派发市场代码（A 股 / 港股 / 美股），调用方无需关心。
    */
   const fetchSingleQuote = async (symbol: string): Promise<void> => {
     try {
       let quote: Quote | null = null;
-      const results = await fetchQuotes([symbol]);
+      const json = await window.electronAPI.getQuotes(symbol);
+      const parsed = JSON.parse(json) as StockQuoteResult[] | { error: string; message: string };
+      const results = Array.isArray(parsed) ? parsed : [];
       if (results.length > 0) {
         const item = results[0];
         quote = {
@@ -647,196 +634,227 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
 
   return (
     <div style={{ maxWidth: 1400, margin: '0 auto' }}>
-      {/* ── 页面标题栏（含右侧指数卡片）── */}
-      <div style={{ marginBottom: 20 }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
-          {/* 左侧：标题 + 副标题 + 操作按钮 */}
-          <div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-              <Title level={2} style={{ margin: 0, fontWeight: 700, letterSpacing: '-0.03em', fontSize: 26, lineHeight: 1 }}>
-                自选股
-              </Title>
-              <div style={{ width: 1, height: 28, background: 'rgba(100,120,160,0.2)', borderRadius: 1 }} />
-              <CurrentDateTime />
-            </div>
-            <Text style={{ color: '#6b7fa8', fontSize: 13, marginTop: 2, display: 'block' }}>
-              {watchlist.length} 只股票 · 每 {refreshInterval >= 60 ? `${refreshInterval / 60} 分钟` : `${refreshInterval} 秒`} 自动刷新
-              {backgroundRefreshing && (
-                <Tag
-                  icon={<LoadingOutlined />}
-                  color="processing"
-                  style={{ marginLeft: 8, fontSize: 11, borderRadius: 8, padding: '0 6px' }}
-                >
-                  刷新中
-                </Tag>
-              )}
+      {/* ── 页面标题栏（含下方指数卡片）── */}
+      <div style={{ marginBottom: 14 }}>
+        {/* 第 1 行：左侧 标题+时间 / 右侧 元信息+搜索框+涨跌Tag+刷新按钮 */}
+        <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 10, rowGap: 6 }}>
+          {/* 左侧：标题（含数量） + 实时日期时间 */}
+          <Title level={2} style={{ margin: 0, fontWeight: 700, letterSpacing: '-0.03em', fontSize: 24, lineHeight: 1 }}>
+            自选 ({watchlist.length})
+          </Title>
+          <div style={{ width: 1, height: 28, background: 'rgba(100,120,160,0.2)', borderRadius: 1 }} />
+          <CurrentDateTime />
+          {/* 最后刷新时间 / 频率（上下两行，与左侧时间对齐） */}
+          <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 1 }}>
+            <Text style={{ fontSize: 13, fontWeight: 600, color: '#4a5a78', fontVariantNumeric: 'tabular-nums', lineHeight: 1.2, whiteSpace: 'nowrap' }}>
+              <LastRefreshIndicator lastRefreshAt={lastRefreshAt} />
             </Text>
-            {watchlist.length > 0 && (
-              <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 10 }}>
-                <Tag icon={<RiseOutlined />} color="error" style={{ borderRadius: 20, padding: '2px 12px', fontSize: 13, fontWeight: 600 }}>
-                  {gainers} 涨
-                </Tag>
-                <Tag icon={<FallOutlined />} color="success" style={{ borderRadius: 20, padding: '2px 12px', fontSize: 13, fontWeight: 600 }}>
-                  {losers} 跌
-                </Tag>
-                <Button
-                  icon={<ReloadOutlined />}
-                  loading={isManualRefreshing}
-                  onClick={async () => {
-                    setIsManualRefreshing(true);
-                    try {
-                      await Promise.all([fetchAllQuotes(), fetchIndices()]);
-                    } finally {
-                      setIsManualRefreshing(false);
-                    }
-                  }}
-                  style={{ borderRadius: 20, fontWeight: 500 }}
-                >
-                  刷新
-                </Button>
-              </div>
-            )}
+            <Text style={{ fontSize: 11, color: '#8c9ab0', lineHeight: 1.2, whiteSpace: 'nowrap' }}>
+              每 {refreshInterval >= 60 ? `${refreshInterval / 60} 分钟` : `${refreshInterval} 秒`} 刷新
+            </Text>
           </div>
 
-          {/* 右侧：关键指数卡片（始终展示预设 6 个，数据未到时用占位符）*/}
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-            {PRESET_INDICES.map(({ symbol, name }) => {
-              const data = indexDataMap.get(symbol);
-              const hasData = !!data;
-              const isUp = hasData && data.change >= 0;
-              const indexColor = hasData ? (isUp ? upColor : downColor) : '#c0cce0';
-              const sign = hasData && isUp ? '+' : '';
+          {/* 右侧：搜索框 + Tag + 刷新按钮，整组靠右 */}
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginLeft: 'auto', flexWrap: 'wrap', rowGap: 6 }}>
+            {backgroundRefreshing && (
+              <Tag icon={<LoadingOutlined />} color="processing" style={{ fontSize: 11, borderRadius: 8, padding: '0 6px', margin: 0 }}>
+                刷新中
+              </Tag>
+            )}
 
-              return (
+            {/* 添加股票搜索框（搜索结果下拉浮于其下方） */}
+            <div style={{ position: 'relative', width: 240 }}>
+              <Input
+                placeholder="搜索股票代码或名称"
+                value={searchQuery}
+                onChange={(e) => handleSearch(e.target.value)}
+                onBlur={() => setTimeout(() => setSearchResults([]), 200)}
+                prefix={<SearchOutlined style={{ color: '#8a9cc8' }} />}
+                suffix={searching ? <LoadingOutlined style={{ color: '#4f6ef7' }} /> : null}
+                style={{ borderRadius: 18, height: 36, fontSize: 13 }}
+              />
+              {searchResults.length > 0 && (
                 <div
-                  key={symbol}
                   style={{
-                    padding: '10px 16px',
-                    borderRadius: 14,
-                    background: 'rgba(255,255,255,0.7)',
-                    backdropFilter: 'blur(8px)',
-                    border: '1px solid rgba(79, 110, 247, 0.1)',
-                    boxShadow: '0 2px 8px rgba(0,0,0,0.05)',
-                    minWidth: 100,
-                    textAlign: 'center',
+                    position: 'absolute',
+                    top: 'calc(100% + 6px)',
+                    left: 0,
+                    right: 0,
+                    background: 'rgba(255,255,255,0.98)',
+                    borderRadius: 12,
+                    border: '1px solid rgba(79, 110, 247, 0.15)',
+                    overflow: 'hidden',
+                    boxShadow: '0 8px 24px rgba(79, 110, 247, 0.18)',
+                    zIndex: 1000,
                   }}
                 >
-                  <div style={{ fontSize: 11, color: '#8a9cc8', fontWeight: 600, marginBottom: 4 }}>
-                    {name}
-                  </div>
-                  <div style={{ fontSize: 15, fontWeight: 800, color: hasData ? '#0f1a2e' : '#c0cce0', letterSpacing: '-0.02em', lineHeight: 1.2 }}>
-                    {hasData ? data.price.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : '—'}
-                  </div>
-                  <div style={{ fontSize: 11, fontWeight: 600, color: indexColor, marginTop: 3 }}>
-                    {hasData ? (
-                      <>
-                        {sign}{data.change.toFixed(2)}
-                        <span style={{ marginLeft: 4 }}>
-                          {sign}{data.changePercent.toFixed(2)}%
-                        </span>
-                      </>
-                    ) : '— —%'}
-                  </div>
+                  {searchResults.map((result, index) => (
+                    <div
+                      key={result.symbol}
+                      className="search-result-item"
+                      onMouseDown={(e) => {
+                        // 用 onMouseDown 抢在 onBlur 之前触发，避免下拉先被关掉
+                        e.preventDefault();
+                        handleAddStock(result.symbol, result.description);
+                      }}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        padding: '10px 12px',
+                        cursor: 'pointer',
+                        borderBottom: index < searchResults.length - 1 ? '1px solid rgba(79, 110, 247, 0.06)' : 'none',
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+                        <div
+                          style={{
+                            width: 28, height: 28, borderRadius: 8,
+                            background: 'linear-gradient(135deg, rgba(79,110,247,0.12), rgba(79,110,247,0.06))',
+                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                            fontWeight: 700, fontSize: 10, color: '#4f6ef7',
+                            flexShrink: 0,
+                          }}
+                        >
+                          {(result.displaySymbol || result.symbol).slice(0, 3)}
+                        </div>
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ fontWeight: 600, fontSize: 12, color: '#1a2e22', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                            {result.displaySymbol || result.symbol}
+                          </div>
+                          <div style={{ fontSize: 11, color: '#7a9e8a', marginTop: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                            {result.description}
+                          </div>
+                        </div>
+                      </div>
+                      <PlusOutlined style={{ color: '#4f6ef7', fontSize: 12, flexShrink: 0, marginLeft: 8 }} />
+                    </div>
+                  ))}
                 </div>
-              );
-            })}</div>
+              )}
+            </div>
+
+            {watchlist.length > 0 && (
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                <Tag icon={<RiseOutlined />} color="error" style={{ borderRadius: 14, padding: '0 10px', fontSize: 12, fontWeight: 600, lineHeight: '22px', margin: 0 }}>
+                  {gainers} 涨
+                </Tag>
+                <Tag icon={<FallOutlined />} color="success" style={{ borderRadius: 14, padding: '0 10px', fontSize: 12, fontWeight: 600, lineHeight: '22px', margin: 0 }}>
+                  {losers} 跌
+                </Tag>
+              </div>
+            )}
+            <Button
+              size="small"
+              icon={<ReloadOutlined />}
+              loading={isManualRefreshing}
+              onClick={async () => {
+                setIsManualRefreshing(true);
+                try {
+                  // 与启动/轮询走同一入口：内部并行刷新指数 + 自选股，
+                  // 并把价格阈值通知回调注入，复用 store 的 in-flight 去重
+                  await refreshDashboardData(checkAlertThreshold);
+                } finally {
+                  setIsManualRefreshing(false);
+                }
+              }}
+              style={{ borderRadius: 14, fontWeight: 500, fontSize: 12, height: 28 }}
+            >
+              刷新
+            </Button>
+          </div>
+        </div>
+
+        {/* 第 2 行：8 个关键指数卡片，等宽分布占满整行 */}
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(8, minmax(0, 1fr))',
+            gap: 6,
+            marginTop: 10,
+          }}
+        >
+          {PRESET_INDICES.map(({ symbol, name }) => {
+            const data = indexDataMap.get(symbol);
+            const hasData = !!data;
+            const isUp = hasData && data.change >= 0;
+            const indexColor = hasData ? (isUp ? upColor : downColor) : '#c0cce0';
+            const sign = hasData && isUp ? '+' : '';
+
+            return (
+              <div
+                key={symbol}
+                style={{
+                  padding: '6px 8px',
+                  borderRadius: 10,
+                  background: 'rgba(255,255,255,0.7)',
+                  backdropFilter: 'blur(8px)',
+                  border: '1px solid rgba(79, 110, 247, 0.1)',
+                  boxShadow: '0 1px 4px rgba(0,0,0,0.04)',
+                  textAlign: 'center',
+                  minWidth: 0, // 允许 grid 子项收缩，避免内容撑破布局
+                }}
+              >
+                <div
+                  style={{
+                    fontSize: 13,
+                    color: '#8a9cc8',
+                    fontWeight: 600,
+                    marginBottom: 3,
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                  }}
+                >
+                  {name}
+                </div>
+                <div
+                  style={{
+                    fontSize: 14,
+                    fontWeight: 800,
+                    color: hasData ? '#0f1a2e' : '#c0cce0',
+                    letterSpacing: '-0.02em',
+                    lineHeight: 1.2,
+                    fontVariantNumeric: 'tabular-nums',
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                  }}
+                >
+                  {hasData ? data.price.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : '—'}
+                </div>
+                <div
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 600,
+                    color: indexColor,
+                    marginTop: 1,
+                    fontVariantNumeric: 'tabular-nums',
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                  }}
+                >
+                  {hasData
+                    ? `${sign}${data.change.toLocaleString('zh-CN', { maximumFractionDigits: 2 })} (${sign}${data.changePercent.toFixed(2)}%)`
+                    : '— (—%)'}
+                </div>
+              </div>
+            );
+          })}
         </div>
       </div>
 
-      {/* ── 搜索栏 ── */}
-      <div
-        className="glass-card"
-        style={{ marginBottom: 16, padding: '16px 20px', borderRadius: 16 }}
-      >
-        <Space direction="vertical" style={{ width: '100%' }} size={10}>
-          <Input.Search
-            placeholder="搜索股票代码或名称（如 AAPL、TSLA）"
-            value={searchQuery}
-            onChange={(e) => handleSearch(e.target.value)}
-            onSearch={() => {}}
-            onBlur={() => setTimeout(() => setSearchResults([]), 200)}
-            prefix={<SearchOutlined />}
-            enterButton={
-              <Button
-                type="primary"
-                style={{ width: 72, minWidth: 72 }}
-                loading={searching}
-              >
-                {!searching && '添加'}
-              </Button>
-            }
-            size="large"
-          />
-          {searchResults.length > 0 && (
-            <div
-              style={{
-                background: 'rgba(255,255,255,0.95)',
-                borderRadius: 12,
-                border: '1px solid rgba(79, 110, 247, 0.15)',
-                overflow: 'hidden',
-                boxShadow: '0 8px 24px rgba(79, 110, 247, 0.1)',
-              }}
-            >
-              {searchResults.map((result, index) => (
-                <div
-                  key={result.symbol}
-                  className="search-result-item"
-                  onClick={() => handleAddStock(result.symbol, result.description)}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'space-between',
-                    padding: '10px 16px',
-                    cursor: 'pointer',
-                    borderBottom: index < searchResults.length - 1 ? '1px solid rgba(79, 110, 247, 0.06)' : 'none',
-                  }}
-                >
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                    <div
-                      style={{
-                        width: 32, height: 32, borderRadius: 8,
-                        background: 'linear-gradient(135deg, rgba(79,110,247,0.12), rgba(79,110,247,0.06))',
-                        display: 'flex', alignItems: 'center', justifyContent: 'center',
-                        fontWeight: 700, fontSize: 11, color: '#4f6ef7',
-                      }}
-                    >
-                      {(result.displaySymbol || result.symbol).slice(0, 3)}
-                    </div>
-                    <div>
-                      <div style={{ fontWeight: 600, fontSize: 13, color: '#1a2e22' }}>
-                        {result.displaySymbol || result.symbol}
-                      </div>
-                      <div style={{ fontSize: 11, color: '#7a9e8a', marginTop: 1 }}>{result.description}</div>
-                    </div>
-                  </div>
-                  <PlusOutlined style={{ color: '#4f6ef7', fontSize: 13 }} />
-                </div>
-              ))}
-            </div>
-          )}
-        </Space>
-      </div>
-
-      {/* ── 错误提示 ── */}
-      {error && (
-        <Alert message="错误" description={error} type="error" closable onClose={() => setError(null)}
-          style={{ marginBottom: 12, borderRadius: 12 }} />
-      )}
-      {rateLimited && (
-        <Alert message="API 限流" description="已触发 Finnhub 频率限制，约 60 秒后自动恢复。" type="warning" closable
-          onClose={() => setRateLimited(false)} style={{ marginBottom: 12, borderRadius: 12 }} />
-      )}
-
-      {/* ── 过滤Tab ── */}
+      {/* ── 过滤Tab（与下方表格紧贴：去掉 marginBottom，只保留上圆角，去掉底边框）── */}
       <div
         style={{
-          marginBottom: 16,
           display: 'flex',
           gap: 8,
           padding: '8px',
           background: 'rgba(255,255,255,0.7)',
-          borderRadius: 12,
+          borderRadius: '12px 12px 0 0',
           border: '1px solid rgba(79, 110, 247, 0.1)',
+          borderBottom: 'none',
         }}
       >
         <button
@@ -921,7 +939,7 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
       ) : (
         <div
           className="glass-card"
-          style={{ borderRadius: 16, overflow: 'hidden' }}
+          style={{ borderRadius: '0 0 16px 16px', overflow: 'hidden' }}
         >
           {/* 表头 */}
           <div
@@ -934,21 +952,68 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
               borderBottom: '1px solid rgba(79, 110, 247, 0.1)',
             }}
           >
-            {visibleColumnDefs.map((col) => (
-              <div
-                key={col.key}
-                style={{
-                  fontSize: 12,
-                  fontWeight: 600,
-                  color: '#8a9cc8',
-                  textTransform: 'uppercase',
-                  letterSpacing: '0.04em',
-                  textAlign: col.key === 'symbol' ? 'left' : 'right',
-                }}
-              >
-                {col.label}
-              </div>
-            ))}
+            {visibleColumnDefs.map((col) => {
+              const isSortable = col.key === 'changePercent';
+              const isActive = isSortable && changePercentSort !== 'none';
+              // 排序按钮图标：none=双向箭头（提示可排序），desc=向下箭头，asc=向上箭头
+              const sortIcon =
+                changePercentSort === 'desc'
+                  ? <ArrowDownOutlined />
+                  : changePercentSort === 'asc'
+                  ? <ArrowUpOutlined />
+                  : <SwapOutlined rotate={90} />;
+              const sortTooltip =
+                changePercentSort === 'none'
+                  ? '点击：按涨跌幅降序排列'
+                  : changePercentSort === 'desc'
+                  ? '当前：降序，点击切换为升序'
+                  : '当前：升序，点击恢复默认顺序';
+
+              // 表头基础色加深一档（#8a9cc8 → #5a6b8c），让默认状态也更易识别
+              // 排序激活时用品牌主色 #4f6ef7 + 加粗，凸显当前生效的排序列
+              const headerColor = isActive ? '#4f6ef7' : '#5a6b8c';
+              // 图标颜色比文字更突出，激活时同主色，未激活时用中性深灰（不抢戏但清晰）
+              const iconColor = isActive ? '#4f6ef7' : '#7a89a8';
+
+              return (
+                <div
+                  key={col.key}
+                  onClick={isSortable ? toggleChangePercentSort : undefined}
+                  style={{
+                    fontSize: 12,
+                    fontWeight: isActive ? 700 : 600,
+                    color: headerColor,
+                    textTransform: 'uppercase',
+                    letterSpacing: '0.04em',
+                    textAlign: col.key === 'symbol' ? 'left' : 'right',
+                    cursor: isSortable ? 'pointer' : 'default',
+                    userSelect: 'none',
+                    transition: 'color 0.15s',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: col.key === 'symbol' ? 'flex-start' : 'flex-end',
+                    gap: 4,
+                  }}
+                  title={isSortable ? sortTooltip : undefined}
+                >
+                  <span>{col.label}</span>
+                  {isSortable && (
+                    <span
+                      style={{
+                        fontSize: 13,
+                        lineHeight: 1,
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        color: iconColor,
+                        fontWeight: 700,
+                      }}
+                    >
+                      {sortIcon}
+                    </span>
+                  )}
+                </div>
+              );
+            })}
             <div style={{ fontSize: 12, fontWeight: 600, color: '#8a9cc8', textTransform: 'uppercase', letterSpacing: '0.04em', textAlign: 'center' }}>排序</div>
             {/* 操作列 */}
             <div style={{ fontSize: 12, fontWeight: 600, color: '#8a9cc8', textAlign: 'right' }}>操作</div>
@@ -976,6 +1041,7 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
                     key={symbol}
                     symbol={symbol}
                     onStockClick={onStockClick}
+                    sortDisabled={changePercentSort !== 'none'}
                   >
                     <div
                       style={{
@@ -1125,6 +1191,28 @@ const Dashboard = ({ onStockClick }: DashboardProps) => {
             </SortableContext>
           </DndContext>
         </div>
+      )}
+
+      {/* ── 错误提示（置于页面最底部，避免占据顶部黄金视觉区）── */}
+      {error && (
+        <Alert
+          message="错误"
+          description={error}
+          type="error"
+          closable
+          onClose={() => setError(null)}
+          style={{ marginTop: 12, borderRadius: 12 }}
+        />
+      )}
+      {rateLimited && (
+        <Alert
+          message="API 限流"
+          description="已触发 Finnhub 频率限制，约 60 秒后自动恢复。"
+          type="warning"
+          closable
+          onClose={() => setRateLimited(false)}
+          style={{ marginTop: 12, borderRadius: 12 }}
+        />
       )}
 
       {/* ── 阈值提醒设置弹窗 ── */}

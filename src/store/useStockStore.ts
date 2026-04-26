@@ -1,5 +1,25 @@
 import { create } from 'zustand';
 import type { Quote, Conversation, ConversationMessage, IndexQuote, UserProfile } from '@/types';
+import type { StockQuoteResult } from '@/services/eastmoney';
+import { handleAPIError } from '@/services/stockApi';
+import { log } from '@/utils/logger';
+
+/**
+ * 自选股批量行情统一入口：通过 IPC 走主进程的 node:https 请求东方财富。
+ *
+ * ⚠️ 必须走 IPC 而不是渲染进程直接调 fetchQuotes()：
+ * 渲染进程 fetch 东方财富 push2 会被浏览器 CORS 拦截（接口不返回 Allow-Origin），
+ * 主进程 node:https 不受 CORS 限制。指数走 IPC 能成功就是这个原因。
+ */
+async function fetchQuotesViaIPC(symbols: string[]): Promise<StockQuoteResult[]> {
+  if (symbols.length === 0) return [];
+  const json = await window.electronAPI.getQuotes(symbols.join(','));
+  const parsed = JSON.parse(json) as StockQuoteResult[] | { error: string; message: string };
+  if (!Array.isArray(parsed)) {
+    throw new Error(`东方财富批量行情失败: ${parsed.message}`);
+  }
+  return parsed;
+}
 
 /** 随机 emoji 头像池 */
 const EMOJI_AVATAR_POOL = ['🐯', '🦊', '🐼', '🐨', '🦁', '🐸', '🦄', '🐙', '🦋', '🐬'];
@@ -151,8 +171,42 @@ interface StockState {
   setActiveConversationId: (id: string | null) => void;
   /** 关键指数行情（上证、科创综指、纳斯达克、标普、恒生、恒生科技） */
   indices: IndexQuote[];
+  /**
+   * 上一次 refreshDashboardData 成功完成的时间戳（毫秒）。
+   * 仅在「指数 + 自选股」并行刷新结束后写入一次，供 UI 展示「最后刷新：xx 秒前」。
+   * 冷启动从 quotes 缓存恢复时不计入——那是历史数据，不代表本次会话已联网刷新。
+   */
+  lastRefreshAt: number | null;
   /** 拉取最新指数行情，失败时静默保留上次数据 */
   fetchIndices: () => Promise<void>;
+  /**
+   * 拉取自选股批量行情（一次东方财富 push2 请求覆盖 A 股 / 港股 / 美股）。
+   *
+   * 内部已做 in-flight 去重（同一时刻只发一个请求），失败时通过 setError 暴露给 UI；
+   * 成功后写入 quotes，并把无数据的 symbol 写入占位 quote 防止 UI 永久 loading；
+   * 同时把有效报价快照保存到 electron-store 作为冷启动缓存。
+   *
+   * @param onAfterQuote 可选的逐条回调，主要用于在主流程外做副作用（如价格阈值通知）
+   */
+  fetchAllQuotes: (onAfterQuote?: (quote: Quote) => void) => Promise<void>;
+  /**
+   * 首页启动时调用一次的总入口：
+   * 1. 并行加载所有持久化配置（watchlist / symbolNames / colorMode / refreshInterval / alertThresholds / visibleColumns）
+   * 2. 恢复当天 quotes 缓存（让用户冷启动立即看到上次的数据）
+   * 3. 标记 dashboardInitialized = true，让轮询 useEffect 可以启动
+   *
+   * 不会主动触发首批行情拉取，由调用方在 init 完成后通过 refreshDashboardData() 触发，
+   * 这样调用方可以注入价格阈值通知回调。
+   */
+  initDashboard: () => Promise<void>;
+  /**
+   * 并行刷新「指数 + 自选股」两类数据，用于首页启动后的首次拉取和定时轮询。
+   *
+   * @param onAfterQuote 透传给 fetchAllQuotes 的逐条回调（如价格阈值通知）
+   */
+  refreshDashboardData: (onAfterQuote?: (quote: Quote) => void) => Promise<void>;
+  /** 首页是否已完成初始化（loadXxx 全部加载完）。轮询 useEffect 通过此标记决定是否启动 */
+  dashboardInitialized: boolean;
   /** 用户个人资料（头像 + 用户名） */
   userProfile: UserProfile;
   /** 从 electron-store 加载用户资料，若无则生成随机默认值 */
@@ -160,6 +214,32 @@ interface StockState {
   /** 保存用户资料到 electron-store */
   saveUserProfile: (profile: UserProfile) => Promise<void>;
 }
+
+/**
+ * fetchIndices 的 in-flight Promise 锁。
+ *
+ * 设计目的：避免同一时刻并发触发指数请求。常见触发源：
+ * 1. React.StrictMode 在 dev 模式下故意双调 useEffect（mount → cleanup → mount）
+ *    导致主进程在 ~40ms 内连续收到两次 stock-get-indices IPC（dev 模式特有）
+ * 2. 父子组件同时触发 fetchIndices（很少见但理论可能）
+ * 3. 用户操作（手动刷新）和定时 interval 撞在同一帧
+ *
+ * 通过一个模块级变量缓存正在进行的 Promise，所有调用方都返回同一个 Promise，
+ * 网络只发一次。请求完成（resolve/reject）后立即清空，下次调用恢复正常拉取。
+ *
+ * 注意：这只去重「同时刻」的并发调用，不是「短时间内」的节流。
+ * 如果上一次请求已完成（即使只过了 10ms），下次调用仍会重新发请求。
+ */
+let inFlightFetchIndices: Promise<void> | null = null;
+
+/**
+ * fetchAllQuotes 的 in-flight Promise 锁。
+ *
+ * 与 inFlightFetchIndices 完全相同的设计目的——避免同时刻并发触发个股批量行情请求。
+ * 触发源：React.StrictMode dev 双调 useEffect、用户手动刷新与定时 interval 撞同帧、
+ * watchlist 变化导致 useEffect 重跑等。详见 BUG-013。
+ */
+let inFlightFetchAllQuotes: Promise<void> | null = null;
 
 export const useStockStore = create<StockState>((set, get) => ({
   watchlist: [],
@@ -176,6 +256,8 @@ export const useStockStore = create<StockState>((set, get) => ({
   activeConversationId: null,
   indices: [],
   userProfile: generateDefaultUserProfile(),
+  dashboardInitialized: false,
+  lastRefreshAt: null,
 
   setSymbolName: async (symbol: string, name: string) => {
     if (!name || !name.trim()) return;
@@ -184,7 +266,7 @@ export const useStockStore = create<StockState>((set, get) => ({
     try {
       await window.electronAPI.setStore('symbolNames', updated);
     } catch (error) {
-      console.error('Failed to save symbolNames:', error);
+      log.error('Failed to save symbolNames:', error);
     }
   },
 
@@ -195,7 +277,7 @@ export const useStockStore = create<StockState>((set, get) => ({
         set({ symbolNames: saved as Record<string, string> });
       }
     } catch (error) {
-      console.error('Failed to load symbolNames:', error);
+      log.error('Failed to load symbolNames:', error);
     }
   },
 
@@ -272,7 +354,7 @@ export const useStockStore = create<StockState>((set, get) => ({
         set({ watchlist: saved });
       }
     } catch (error) {
-      console.error('Failed to load watchlist:', error);
+      log.error('Failed to load watchlist:', error);
     }
   },
   
@@ -280,7 +362,7 @@ export const useStockStore = create<StockState>((set, get) => ({
     try {
       await window.electronAPI.setStore('watchlist', get().watchlist);
     } catch (error) {
-      console.error('Failed to save watchlist:', error);
+      log.error('Failed to save watchlist:', error);
     }
   },
   
@@ -301,7 +383,7 @@ export const useStockStore = create<StockState>((set, get) => ({
     try {
       await window.electronAPI.setStore('colorMode', mode);
     } catch (error) {
-      console.error('Failed to save colorMode:', error);
+      log.error('Failed to save colorMode:', error);
     }
   },
 
@@ -312,7 +394,7 @@ export const useStockStore = create<StockState>((set, get) => ({
         set({ colorMode: saved });
       }
     } catch (error) {
-      console.error('Failed to load colorMode:', error);
+      log.error('Failed to load colorMode:', error);
     }
   },
 
@@ -321,7 +403,7 @@ export const useStockStore = create<StockState>((set, get) => ({
     try {
       await window.electronAPI.setStore('refreshInterval', interval);
     } catch (error) {
-      console.error('Failed to save refreshInterval:', error);
+      log.error('Failed to save refreshInterval:', error);
     }
   },
 
@@ -344,7 +426,7 @@ export const useStockStore = create<StockState>((set, get) => ({
         set({ refreshInterval: 300 });
       }
     } catch (error) {
-      console.error('Failed to load refreshInterval:', error);
+      log.error('Failed to load refreshInterval:', error);
     }
   },
 
@@ -355,7 +437,7 @@ export const useStockStore = create<StockState>((set, get) => ({
     try {
       await window.electronAPI.setStore('alertThresholds', updated);
     } catch (error) {
-      console.error('Failed to save alertThresholds:', error);
+      log.error('Failed to save alertThresholds:', error);
     }
   },
 
@@ -366,7 +448,7 @@ export const useStockStore = create<StockState>((set, get) => ({
     try {
       await window.electronAPI.setStore('alertThresholds', current);
     } catch (error) {
-      console.error('Failed to save alertThresholds:', error);
+      log.error('Failed to save alertThresholds:', error);
     }
   },
 
@@ -377,7 +459,7 @@ export const useStockStore = create<StockState>((set, get) => ({
         set({ alertThresholds: saved as Record<string, AlertThreshold> });
       }
     } catch (error) {
-      console.error('Failed to load alertThresholds:', error);
+      log.error('Failed to load alertThresholds:', error);
     }
   },
 
@@ -388,7 +470,7 @@ export const useStockStore = create<StockState>((set, get) => ({
     try {
       await window.electronAPI.setStore('visibleColumns', withSymbol);
     } catch (error) {
-      console.error('Failed to save visibleColumns:', error);
+      log.error('Failed to save visibleColumns:', error);
     }
   },
 
@@ -399,7 +481,7 @@ export const useStockStore = create<StockState>((set, get) => ({
         set({ visibleColumns: saved as ColumnKey[] });
       }
     } catch (error) {
-      console.error('Failed to load visibleColumns:', error);
+      log.error('Failed to load visibleColumns:', error);
     }
   },
 
@@ -439,7 +521,7 @@ export const useStockStore = create<StockState>((set, get) => ({
         }
       }
     } catch (error) {
-      console.error('Failed to load quotesCache:', error);
+      log.error('Failed to load quotesCache:', error);
     }
     return false;
   },
@@ -452,7 +534,7 @@ export const useStockStore = create<StockState>((set, get) => ({
       };
       await window.electronAPI.setStore('quotesCache', cache);
     } catch (error) {
-      console.error('Failed to save quotesCache:', error);
+      log.error('Failed to save quotesCache:', error);
     }
   },
 
@@ -463,7 +545,7 @@ export const useStockStore = create<StockState>((set, get) => ({
         set({ conversations: saved as Conversation[] });
       }
     } catch (error) {
-      console.error('Failed to load conversations:', error);
+      log.error('Failed to load conversations:', error);
     }
   },
 
@@ -482,7 +564,7 @@ export const useStockStore = create<StockState>((set, get) => ({
     try {
       await window.electronAPI.setStore('conversations', updated);
     } catch (error) {
-      console.error('Failed to save conversations:', error);
+      log.error('Failed to save conversations:', error);
     }
     return newConversation.id;
   },
@@ -519,7 +601,7 @@ export const useStockStore = create<StockState>((set, get) => ({
     try {
       await window.electronAPI.setStore('conversations', updated);
     } catch (error) {
-      console.error('Failed to save conversations:', error);
+      log.error('Failed to save conversations:', error);
     }
     return newMessage;
   },
@@ -534,7 +616,7 @@ export const useStockStore = create<StockState>((set, get) => ({
     try {
       await window.electronAPI.setStore('conversations', updated);
     } catch (error) {
-      console.error('Failed to delete conversation:', error);
+      log.error('Failed to delete conversation:', error);
     }
   },
 
@@ -550,7 +632,7 @@ export const useStockStore = create<StockState>((set, get) => ({
         await window.electronAPI.setStore('userProfile', defaultProfile);
       }
     } catch (error) {
-      console.error('Failed to load userProfile:', error);
+      log.error('Failed to load userProfile:', error);
     }
   },
 
@@ -559,7 +641,7 @@ export const useStockStore = create<StockState>((set, get) => ({
     try {
       await window.electronAPI.setStore('userProfile', profile);
     } catch (error) {
-      console.error('Failed to save userProfile:', error);
+      log.error('Failed to save userProfile:', error);
     }
   },
 
@@ -568,43 +650,189 @@ export const useStockStore = create<StockState>((set, get) => ({
   },
 
   fetchIndices: async () => {
-    try {
-      // ⚠️ 必须走 IPC 让主进程（Node fetch）发起请求：
-      // 渲染进程（Chromium）直接 fetch 东方财富会被 CORS 拦截
-      // （东方财富不返回 Access-Control-Allow-Origin，且 User-Agent / Referer 在浏览器中是 unsafe header）
-      console.log('[fetchIndices] 调用 window.electronAPI.getIndices()');
-      const raw = await window.electronAPI.getIndices();
-      const rawStr = String(raw ?? '');
-      console.log('[fetchIndices] 主进程原始返回（前 500 字符）:', rawStr.slice(0, 500));
-
-      const parsed: unknown = JSON.parse(rawStr);
-
-      // 兼容三种返回形态：
-      //   1. 数组 IndexQuote[]                         （东方财富/Python 正常路径）
-      //   2. { error, message }                        （Python execFile 失败的降级返回）
-      //   3. { indices: IndexQuote[] }                 （历史/兜底封装格式）
-      let result: IndexQuote[] | null = null;
-      if (Array.isArray(parsed)) {
-        result = parsed as IndexQuote[];
-      } else if (parsed && typeof parsed === 'object' && 'indices' in parsed
-                 && Array.isArray((parsed as { indices: unknown }).indices)) {
-        result = (parsed as { indices: IndexQuote[] }).indices;
-      } else if (parsed && typeof parsed === 'object' && 'error' in parsed) {
-        console.warn('[fetchIndices] 主进程返回错误:', parsed);
-      } else {
-        console.warn('[fetchIndices] 主进程返回未知格式:', parsed);
-      }
-
-      if (result && result.length > 0) {
-        console.log('[fetchIndices] 解析得到', result.length, '个指数:',
-                    result.map((r) => `${r.symbol}=${r.price}`).join(', '));
-        set({ indices: result });
-      } else {
-        console.warn('[fetchIndices] 解析后无有效指数数据，indices 保持不变');
-      }
-    } catch (err) {
-      // 静默失败：保留上次数据，不影响主流程
-      console.error('[fetchIndices] 失败:', err);
+    // in-flight 去重：同一时刻只允许一个请求在飞，避免 React.StrictMode dev 双调
+    // 或父子组件并发触发导致主进程收到重复 IPC（41ms 内两次 stock-get-indices 即此原因）。
+    // 复用同一个 Promise 让所有调用方共享同一份结果。
+    if (inFlightFetchIndices) {
+      log.log('[fetchIndices] 已有请求在飞，复用 in-flight Promise');
+      return inFlightFetchIndices;
     }
+
+    const task = (async () => {
+      try {
+        // ⚠️ 必须走 IPC 让主进程（Node fetch）发起请求：
+        // 渲染进程（Chromium）直接 fetch 东方财富会被 CORS 拦截
+        // （东方财富不返回 Access-Control-Allow-Origin，且 User-Agent / Referer 在浏览器中是 unsafe header）
+        log.log('[fetchIndices] 调用 window.electronAPI.getIndices()');
+        const raw = await window.electronAPI.getIndices();
+        const rawStr = String(raw ?? '');
+        log.log('[fetchIndices] 主进程原始返回（前 500 字符）:', rawStr.slice(0, 500));
+
+        const parsed: unknown = JSON.parse(rawStr);
+
+        // 兼容三种返回形态：
+        //   1. 数组 IndexQuote[]                         （东方财富/Python 正常路径）
+        //   2. { error, message }                        （Python execFile 失败的降级返回）
+        //   3. { indices: IndexQuote[] }                 （历史/兜底封装格式）
+        let result: IndexQuote[] | null = null;
+        if (Array.isArray(parsed)) {
+          result = parsed as IndexQuote[];
+        } else if (parsed && typeof parsed === 'object' && 'indices' in parsed
+                   && Array.isArray((parsed as { indices: unknown }).indices)) {
+          result = (parsed as { indices: IndexQuote[] }).indices;
+        } else if (parsed && typeof parsed === 'object' && 'error' in parsed) {
+          log.warn('[fetchIndices] 主进程返回错误:', parsed);
+        } else {
+          log.warn('[fetchIndices] 主进程返回未知格式:', parsed);
+        }
+
+        if (result && result.length > 0) {
+          log.log('[fetchIndices] 解析得到', result.length, '个指数:',
+                      result.map((r) => `${r.symbol}=${r.price}`).join(', '));
+          set({ indices: result });
+        } else {
+          log.warn('[fetchIndices] 解析后无有效指数数据，indices 保持不变');
+        }
+      } catch (err) {
+        // 静默失败：保留上次数据，不影响主流程
+        log.error('[fetchIndices] 失败:', err);
+      } finally {
+        // 无论成功或失败都要释放 in-flight 锁，让下个 interval 周期可以重新拉
+        inFlightFetchIndices = null;
+      }
+    })();
+
+    inFlightFetchIndices = task;
+    return task;
+  },
+
+  fetchAllQuotes: async (onAfterQuote) => {
+    const { watchlist } = get();
+    if (watchlist.length === 0) return;
+
+    // in-flight 去重：避免 React.StrictMode dev 双调 useEffect、并发触发或
+    // 用户手动刷新与定时 interval 撞同帧导致重复批量请求。详见 BUG-013。
+    if (inFlightFetchAllQuotes) {
+      log.log('[fetchAllQuotes] 已有请求在飞，复用 in-flight Promise');
+      return inFlightFetchAllQuotes;
+    }
+
+    const task = (async () => {
+      set({ error: null });
+      try {
+        // 一次东方财富 push2 请求拿到 A 股 / 港股 / 美股全部行情，无需按市场分组
+        // 必须走 IPC：渲染进程直接 fetch 东方财富会被 CORS 拦截，详见 fetchQuotesViaIPC 注释
+        log.debug(`[fetchAllQuotes] symbols=${watchlist.join(',')}`);
+        const results: StockQuoteResult[] = await fetchQuotesViaIPC(watchlist);
+
+        // 顺便回填公司中文名（东方财富返回的 f14 字段）
+        // setSymbolName 是 async（每次会 IPC 写盘），用 Promise.all 等全部完成
+        await Promise.all(
+          results
+            .filter((item) => item.symbol && item.name && item.name !== item.symbol)
+            .map((item) => get().setSymbolName(item.symbol, item.name)),
+        );
+
+        const validQuotes: Quote[] = results.map((item): Quote => ({
+          symbol: item.symbol,
+          price: item.price,
+          change: item.change,
+          changePercent: item.changePercent,
+          high: item.high,
+          low: item.low,
+          open: item.open,
+          previousClose: item.previousClose,
+          volume: item.volume,
+          timestamp: new Date().toISOString(),
+        }));
+
+        // 东方财富返回空：视为本轮刷新失败（防止接口降级返回 [] 时用户看不出来失败）
+        if (results.length === 0 && watchlist.length > 0) {
+          throw new Error('东方财富返回空数据，本次刷新未获取到任何行情');
+        }
+
+        get().updateQuotes(validQuotes);
+        // 让调用方拿到每条 quote 做副作用（如价格阈值通知）
+        if (onAfterQuote) {
+          validQuotes.forEach((quote) => onAfterQuote(quote));
+        }
+
+        // 持久化有效报价快照（仅缓存 price > 0 的真实数据，避免占位 quote 污染缓存）
+        // 下次冷启动时 loadQuotesCache() 会恢复，A 股/港股无需等待 Python 脚本重新加载
+        if (validQuotes.some((q) => q.price > 0)) {
+          await get().saveQuotesCache();
+        }
+
+        // 对本次刷新后仍无数据的 symbol 写占位 quote，避免 UI 永久 loading
+        // 场景：港股 yfinance 限流、A 股 AKShare 不可用、Finnhub Key 缺失等
+        const fetchedSymbols = new Set(validQuotes.map((q) => q.symbol));
+        const currentQuotes = get().quotes;
+        const placeholderQuotes: Quote[] = watchlist
+          .filter((s) => !fetchedSymbols.has(s) && currentQuotes[s] === undefined)
+          .map((s): Quote => ({
+            symbol: s,
+            price: 0,
+            change: 0,
+            changePercent: 0,
+            timestamp: new Date().toISOString(),
+          }));
+        if (placeholderQuotes.length > 0) {
+          get().updateQuotes(placeholderQuotes);
+        }
+      } catch (err) {
+        log.warn('[fetchAllQuotes] 失败:', err);
+        set({ error: handleAPIError(err) });
+      } finally {
+        inFlightFetchAllQuotes = null;
+      }
+    })();
+
+    inFlightFetchAllQuotes = task;
+    return task;
+  },
+
+  initDashboard: async () => {
+    // 已初始化过则直接返回，避免 React.StrictMode dev 双调 useEffect 重复 load
+    if (get().dashboardInitialized) {
+      log.log('[initDashboard] 已初始化，跳过');
+      return;
+    }
+
+    log.log('[initDashboard] 开始加载所有持久化配置');
+
+    // 并行加载所有持久化配置：彼此独立，并发执行可以把首屏阻塞从 6×IPC 降到 1×IPC 串行时间
+    // 任何单项失败不会阻塞其他项（每个 loadXxx 内部都有独立 try/catch）
+    const {
+      loadWatchlist, loadSymbolNames, loadColorMode, loadRefreshInterval,
+      loadAlertThresholds, loadVisibleColumns, loadQuotesCache,
+    } = get();
+    await Promise.all([
+      loadWatchlist(),
+      loadSymbolNames(),
+      loadColorMode(),
+      loadRefreshInterval(),
+      loadAlertThresholds(),
+      loadVisibleColumns(),
+    ]);
+
+    // quotes 缓存放在配置加载之后单独 await：返回值用于 UI 决定是否显示「后台刷新中」提示
+    // （loadQuotesCache 内部依赖 quotes 字段更新，无需依赖其他配置）
+    const hasTodayCache = await loadQuotesCache();
+    log.log(`[initDashboard] 配置加载完成，hasTodayCache=${hasTodayCache}`);
+
+    set({ dashboardInitialized: true });
+  },
+
+  refreshDashboardData: async (onAfterQuote) => {
+    // 并行触发两类首页数据：指数 + 自选股，互不阻塞
+    // 任意一类失败不影响另一类（fetchIndices 内部 catch 静默；fetchAllQuotes 通过 setError 暴露）
+    // 用 allSettled：只要本轮真正执行过（不论结果），就视为发生了一次刷新尝试，
+    // 写入 lastRefreshAt 让 UI 反映「最近一次拉数据的时间」。
+    // 任一子任务的 reject 都已在内部处理（错误转 setError / 静默），不会冒泡到这里。
+    await Promise.allSettled([
+      get().fetchIndices(),
+      get().fetchAllQuotes(onAfterQuote),
+    ]);
+    set({ lastRefreshAt: Date.now() });
   },
 }));

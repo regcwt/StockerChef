@@ -1,5 +1,6 @@
 import axios from 'axios';
 import type { Quote, NewsItem, StockProfile, SearchResult, Stock, HistoricalDataPoint, HistoricalDataResult } from '@/types';
+import { log } from '@/utils/logger';
 
 const BASE_URL = 'https://finnhub.io/api/v1';
 
@@ -129,27 +130,107 @@ export const getQuoteDirect = async (symbol: string): Promise<Quote | null> => {
   }
 };
 
+/**
+ * 公司基本信息缓存。
+ *
+ * - 缓存 key：股票 symbol（大写）
+ * - 缓存时长：1 小时（公司基本信息几乎不变，无需频繁刷新）
+ * - in-flight 去重：同一 symbol 同时刻多次调用复用同一个 Promise，避免并发触发重复请求
+ *
+ * 触发收益：用户在 detail tab 反复切换股票或反复进出 detail tab 时，
+ * 1 小时内同一只股票最多只发一次 Finnhub `/stock/profile2` 请求，节省限流配额。
+ */
+const PROFILE_CACHE_TTL_MS = 60 * 60 * 1000;
+const profileCache = new Map<string, { data: Partial<Stock>; timestamp: number }>();
+const inFlightProfileRequests = new Map<string, Promise<Partial<Stock>>>();
+
 export const getProfile = async (symbol: string): Promise<Partial<Stock>> => {
-  return apiRequest(async () => {
+  const upperSymbol = symbol.toUpperCase().trim();
+
+  // 1. 命中有效缓存（1h 内）：直接返回，零网络
+  const cached = profileCache.get(upperSymbol);
+  if (cached && Date.now() - cached.timestamp < PROFILE_CACHE_TTL_MS) {
+    return cached.data;
+  }
+
+  // 2. 命中 in-flight 请求：复用同一个 Promise（避免并发场景下重复发请求）
+  const inFlight = inFlightProfileRequests.get(upperSymbol);
+  if (inFlight) {
+    return inFlight;
+  }
+
+  // 3. 真正发起请求，登记 in-flight，完成后写入缓存并清理 in-flight
+  const promise = apiRequest(async () => {
     const token = await requireApiKey();
     const response = await axios.get(`${BASE_URL}/stock/profile2`, {
-      params: { symbol, token },
+      params: { symbol: upperSymbol, token },
     });
 
     const data: StockProfile = response.data;
 
     return {
-      symbol,
-      name: data.name || symbol,
+      symbol: upperSymbol,
+      name: data.name || upperSymbol,
       marketCap: data.marketCapitalization,
       description: `${data.country} - ${data.industry}`,
     };
-  });
+  })
+    .then((result) => {
+      profileCache.set(upperSymbol, { data: result, timestamp: Date.now() });
+      return result;
+    })
+    .finally(() => {
+      // 无论成功或失败都要清理 in-flight，避免错误请求被永久缓存为 "正在进行"
+      inFlightProfileRequests.delete(upperSymbol);
+    });
+
+  inFlightProfileRequests.set(upperSymbol, promise);
+  return promise;
 };
 
+/**
+ * 获取个股新闻列表。
+ *
+ * 数据源策略：
+ * 1. **首选**：东方财富 search-api（通过主进程 IPC `stock-get-news` 调用，主进程内部走 nodeHttpsGet）
+ *    - 覆盖 A 股 / 港股 / 美股，无需任何 API Key
+ *    - 主进程发起，绕开渲染进程的 CORS 限制（参见 AGENTS.md BUG-014）
+ *    - 返回字段已在 service 层映射为 NewsItem 结构
+ * 2. **降级**：Finnhub `/company-news`（仅当 Key 已配置且东方财富失败/返回空时尝试）
+ *    - Finnhub Key 缺失时**不抛错**，返回东方财富的空结果即可（参见 §3.9）
+ *    - Finnhub 调用仍走 `apiRequest()` 限流队列
+ *
+ * 注意：东方财富对 A 股 / 港股 / 美股 ticker 都有较好的中文资讯覆盖，是 Lazada 等中概股 / 港 A 股的主要数据源；
+ * Finnhub 主要覆盖美股英文资讯，作为美股的额外数据源。
+ */
 export const getNews = async (symbol: string): Promise<NewsItem[]> => {
+  // ── 主链路：东方财富（IPC） ────────────────────────────────────────────────
+  try {
+    const raw = await window.electronAPI.getNews(symbol);
+    const parsed = JSON.parse(raw) as NewsItem[] | { error: string; message: string };
+
+    if (Array.isArray(parsed)) {
+      if (parsed.length > 0) {
+        return parsed;
+      }
+      log.warn(`[News] 东方财富返回 0 条资讯，symbol=${symbol}，尝试 Finnhub 兜底`);
+    } else {
+      log.warn(`[News] 东方财富资讯请求失败：${parsed.error} - ${parsed.message}，尝试 Finnhub 兜底`);
+    }
+  } catch (err) {
+    // window.electronAPI 不存在（如纯浏览器环境）或 IPC 抛错，走兜底
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`[News] 调用 IPC stock-get-news 异常：${msg}，尝试 Finnhub 兜底`);
+  }
+
+  // ── 兜底：Finnhub /company-news（仅在 Key 已配置时尝试） ───────────────────
+  const token = await getFinnhubApiKey();
+  if (!token) {
+    log.log('[News] Finnhub Key 未配置，跳过兜底，返回空列表');
+    return [];
+  }
+
   return apiRequest(async () => {
-    const token = await requireApiKey();
     const today = new Date();
     const sevenDaysAgo = new Date(today);
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
@@ -296,7 +377,7 @@ export const getCNQuote = async (symbol: string): Promise<Quote | null> => {
     const parsed = JSON.parse(rawJson);
 
     if (parsed && 'error' in parsed) {
-      console.warn(`[AKShare] getCNQuote error for ${symbol}:`, parsed.message);
+      log.warn(`[AKShare] getCNQuote error for ${symbol}:`, parsed.message);
       return null;
     }
 
@@ -318,7 +399,7 @@ export const getCNQuote = async (symbol: string): Promise<Quote | null> => {
 
     return null;
   } catch (error: any) {
-    console.warn(`[AKShare] getCNQuote failed for ${symbol}:`, error.message);
+    log.warn(`[AKShare] getCNQuote failed for ${symbol}:`, error.message);
     return null;
   }
 };
@@ -333,7 +414,7 @@ export const searchCNSymbol = async (query: string): Promise<SearchResult[]> => 
     const parsed = JSON.parse(rawJson);
 
     if (parsed && 'error' in parsed) {
-      console.warn('[AKShare] searchCNSymbol error:', parsed.message);
+      log.warn('[AKShare] searchCNSymbol error:', parsed.message);
       return [];
     }
 
@@ -343,7 +424,7 @@ export const searchCNSymbol = async (query: string): Promise<SearchResult[]> => 
 
     return [];
   } catch (error: any) {
-    console.warn('[AKShare] searchCNSymbol failed:', error.message);
+    log.warn('[AKShare] searchCNSymbol failed:', error.message);
     return [];
   }
 };

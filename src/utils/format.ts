@@ -63,8 +63,18 @@ export const formatMarketCap = (capInMillions: number): string => {
   return `${cap.toFixed(2)}`;
 };
 
-export const formatDate = (dateString: string): string => {
-  const date = new Date(dateString);
+/**
+ * 格式化日期显示。
+ * 接受三种输入：ISO 字符串 / Unix 秒级时间戳 / Unix 毫秒级时间戳。
+ * 数字情况下：≤ 1e12 视为秒级（×1000），> 1e12 视为毫秒级（直接用）。
+ */
+export const formatDate = (input: string | number): string => {
+  let date: Date;
+  if (typeof input === 'number') {
+    date = new Date(input < 1e12 ? input * 1000 : input);
+  } else {
+    date = new Date(input);
+  }
   return date.toLocaleDateString('en-US', {
     year: 'numeric',
     month: 'short',

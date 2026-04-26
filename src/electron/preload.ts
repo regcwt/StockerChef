@@ -13,6 +13,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getSettings: (key: string) => ipcRenderer.invoke('settings-get', key),
   setSettings: (key: string, value: unknown) => ipcRenderer.invoke('settings-set', key, value),
   showNotification: (title: string, body: string) => ipcRenderer.invoke('show-notification', title, body),
+  /** 自选股批量行情（混合市场，A 股 + 港股 + 美股一次拿，逗号分隔，返回 JSON 字符串） */
+  getQuotes: (symbols: string) => ipcRenderer.invoke('stock-get-quotes', symbols),
   /** A 股实时行情（多只，逗号分隔代码，返回 JSON 字符串） */
   getCNQuote: (symbols: string) => ipcRenderer.invoke('stock-get-cn-quote', symbols),
   /** A 股搜索（返回 JSON 字符串） */
@@ -23,6 +25,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getUSQuote: (symbols: string) => ipcRenderer.invoke('stock-get-us-quote', symbols),
   /** 关键指数行情（上证、科创综指、纳斯达克、标普、恒生、恒生科技，返回 JSON 字符串） */
   getIndices: () => ipcRenderer.invoke('stock-get-indices'),
+  /** 个股资讯（东方财富 search-api，返回 JSON 字符串：NewsItem[] 或 { error, message }） */
+  getNews: (symbol: string) => ipcRenderer.invoke('stock-get-news', symbol),
+  /** 公司详情（东方财富 emweb F10 + push2 stock/get 聚合，返回 JSON 字符串：CompanyDetail 或 { error, message }） */
+  getCompanyDetail: (symbol: string) => ipcRenderer.invoke('stock-get-company-detail', symbol),
   /** 预置股票数据（本地 JSON 文件，用于快速搜索） */
   getPresetStockData: (market: 'cn' | 'hk' | 'us') =>
     ipcRenderer.invoke('stock-get-preset-data', market),
